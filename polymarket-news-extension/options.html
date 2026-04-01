@@ -1,0 +1,101 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Polymarket News — Settings</title>
+  <link rel="stylesheet" href="options.css" />
+</head>
+<body>
+  <div class="page">
+    <header>
+      <span class="logo">📈</span>
+      <h1>Polymarket Live News — Settings</h1>
+    </header>
+
+    <div id="save-banner" class="banner banner--hidden">
+      ✅ Settings saved successfully!
+    </div>
+
+    <form id="settings-form">
+
+      <!-- ── General ───────────────────────────────────────────────────── -->
+      <section>
+        <h2>General</h2>
+        <div class="field">
+          <label for="refreshInterval">Auto-refresh interval (minutes)</label>
+          <input type="number" id="refreshInterval" name="refreshInterval"
+                 min="1" max="60" value="5" />
+          <p class="hint">How often to automatically fetch new articles.</p>
+        </div>
+      </section>
+
+      <!-- ── News API ──────────────────────────────────────────────────── -->
+      <section>
+        <h2>📰 News API <span class="optional">(optional)</span></h2>
+        <p class="section-desc">
+          Google News RSS works without a key. For better results, add a free
+          <a href="https://newsapi.org/register" target="_blank">NewsAPI.org</a> key.
+        </p>
+        <div class="field">
+          <label for="newsApiKey">NewsAPI.org API Key</label>
+          <input type="password" id="newsApiKey" name="newsApiKey"
+                 placeholder="xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx" autocomplete="off" />
+        </div>
+      </section>
+
+      <!-- ── Reddit ────────────────────────────────────────────────────── -->
+      <section>
+        <h2>🤖 Reddit</h2>
+        <p class="section-desc">
+          Works out of the box. Add subreddits to restrict searches to those communities.
+        </p>
+        <div class="field">
+          <label for="subreddits">Subreddits to search <span class="optional">(comma-separated)</span></label>
+          <input type="text" id="subreddits" name="subreddits"
+                 placeholder="politics, worldnews, economics, PredictionMarkets" />
+          <p class="hint">e.g. <code>politics, worldnews, PredictionMarkets</code>. Leave blank to search all of Reddit.</p>
+        </div>
+      </section>
+
+      <!-- ── Telegram ──────────────────────────────────────────────────── -->
+      <section>
+        <h2>✈ Telegram</h2>
+        <p class="section-desc">
+          To receive Telegram channel messages you need a Telegram Bot.
+        </p>
+        <ol class="instructions">
+          <li>Message <a href="https://t.me/BotFather" target="_blank">@BotFather</a> on Telegram and create a new bot with <code>/newbot</code>.</li>
+          <li>Copy your bot token (format: <code>123456:ABC-DEF…</code>) and paste it below.</li>
+          <li>Add the bot as a member (or admin) to the channels you want to monitor.</li>
+          <li>List those channel usernames below (without <code>@</code>).</li>
+        </ol>
+        <div class="field">
+          <label for="telegramBotToken">Bot Token</label>
+          <input type="password" id="telegramBotToken" name="telegramBotToken"
+                 placeholder="123456789:ABCdefGHIjklMNOpqrSTUvwxYZ" autocomplete="off" />
+        </div>
+        <div class="field">
+          <label for="telegramChannels">Channel usernames <span class="optional">(comma-separated, no @)</span></label>
+          <input type="text" id="telegramChannels" name="telegramChannels"
+                 placeholder="polymarketofficial, cryptonews, worldpolitics" />
+          <p class="hint">The bot must be a member of each channel listed here.</p>
+        </div>
+        <div class="field">
+          <button type="button" id="btn-test-telegram" class="btn btn--secondary">
+            Test Telegram Connection
+          </button>
+          <span id="telegram-test-result" class="test-result"></span>
+        </div>
+      </section>
+
+      <div class="actions">
+        <button type="submit" class="btn btn--primary">Save Settings</button>
+        <button type="button" id="btn-clear" class="btn btn--danger">Clear All</button>
+      </div>
+    </form>
+  </div>
+
+  <script src="options.js"></script>
+</body>
+</html>

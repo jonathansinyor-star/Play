@@ -1,0 +1,186 @@
+/* ── Reset & Base ─────────────────────────────────────────────────────────── */
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+:root {
+  --bg: #0f1117;
+  --bg2: #1a1d27;
+  --bg3: #22263a;
+  --border: #2e3248;
+  --accent: #6c63ff;
+  --accent2: #00d4aa;
+  --text: #e8eaf6;
+  --text2: #8891b4;
+  --text3: #5c6380;
+  --red: #ff4d6d;
+  --green: #00d4aa;
+  --radius: 8px;
+}
+
+body {
+  background: var(--bg);
+  color: var(--text);
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  font-size: 14px;
+  min-height: 100vh;
+}
+
+.page {
+  max-width: 640px;
+  margin: 0 auto;
+  padding: 32px 24px 60px;
+}
+
+/* ── Header ──────────────────────────────────────────────────────────────── */
+header {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin-bottom: 28px;
+  padding-bottom: 16px;
+  border-bottom: 1px solid var(--border);
+}
+.logo { font-size: 28px; }
+h1 {
+  font-size: 18px;
+  font-weight: 700;
+  color: var(--text);
+}
+
+/* ── Save banner ────────────────────────────────────────────────────────── */
+.banner {
+  padding: 10px 16px;
+  border-radius: var(--radius);
+  margin-bottom: 20px;
+  font-size: 13px;
+  font-weight: 500;
+  background: rgba(0,212,170,.12);
+  color: var(--green);
+  border: 1px solid rgba(0,212,170,.25);
+  transition: opacity 0.3s;
+}
+.banner--hidden { display: none; }
+
+/* ── Sections ────────────────────────────────────────────────────────────── */
+section {
+  background: var(--bg2);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 20px;
+  margin-bottom: 16px;
+}
+
+section h2 {
+  font-size: 14px;
+  font-weight: 700;
+  margin-bottom: 10px;
+  color: var(--text);
+}
+
+.optional {
+  font-size: 11px;
+  font-weight: 400;
+  color: var(--text3);
+}
+
+.section-desc {
+  font-size: 12.5px;
+  color: var(--text2);
+  line-height: 1.5;
+  margin-bottom: 14px;
+}
+.section-desc a { color: var(--accent); text-decoration: none; }
+.section-desc a:hover { text-decoration: underline; }
+
+/* ── Instructions ────────────────────────────────────────────────────────── */
+.instructions {
+  font-size: 12.5px;
+  color: var(--text2);
+  line-height: 1.6;
+  padding-left: 18px;
+  margin-bottom: 14px;
+}
+.instructions a { color: var(--accent); text-decoration: none; }
+.instructions a:hover { text-decoration: underline; }
+.instructions code {
+  background: var(--bg3);
+  border: 1px solid var(--border);
+  padding: 1px 5px;
+  border-radius: 4px;
+  font-size: 11px;
+  color: var(--text);
+}
+
+/* ── Fields ──────────────────────────────────────────────────────────────── */
+.field {
+  margin-bottom: 14px;
+}
+.field:last-child { margin-bottom: 0; }
+
+label {
+  display: block;
+  font-size: 12.5px;
+  font-weight: 600;
+  color: var(--text2);
+  margin-bottom: 5px;
+}
+
+input[type="text"],
+input[type="password"],
+input[type="number"] {
+  width: 100%;
+  padding: 9px 12px;
+  background: var(--bg3);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  color: var(--text);
+  font-size: 13px;
+  outline: none;
+  transition: border-color 0.15s;
+}
+input:focus { border-color: var(--accent); }
+input::placeholder { color: var(--text3); }
+
+.hint {
+  font-size: 11px;
+  color: var(--text3);
+  margin-top: 5px;
+  line-height: 1.5;
+}
+.hint code {
+  background: var(--bg3);
+  padding: 1px 4px;
+  border-radius: 3px;
+  font-size: 10.5px;
+}
+
+/* ── Buttons ─────────────────────────────────────────────────────────────── */
+.btn {
+  padding: 9px 18px;
+  border-radius: 6px;
+  border: none;
+  font-size: 13px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: opacity 0.15s, transform 0.1s;
+}
+.btn:hover { opacity: 0.88; }
+.btn:active { transform: scale(0.98); }
+
+.btn--primary { background: var(--accent); color: #fff; }
+.btn--secondary { background: var(--bg3); color: var(--text2); border: 1px solid var(--border); }
+.btn--danger { background: rgba(255,77,109,.15); color: var(--red); border: 1px solid rgba(255,77,109,.25); }
+
+.test-result {
+  font-size: 12px;
+  margin-left: 10px;
+  color: var(--text2);
+}
+.test-result--ok  { color: var(--green); }
+.test-result--err { color: var(--red); }
+
+/* ── Actions ─────────────────────────────────────────────────────────────── */
+.actions {
+  display: flex;
+  gap: 10px;
+  margin-top: 8px;
+}

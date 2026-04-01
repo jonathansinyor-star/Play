@@ -1,0 +1,67 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Polymarket Live News</title>
+  <link rel="stylesheet" href="popup.css" />
+</head>
+<body>
+  <div id="app">
+    <!-- Header -->
+    <header>
+      <div class="header-left">
+        <div class="logo">📈</div>
+        <div class="header-text">
+          <h1>Polymarket News</h1>
+          <span id="status-badge" class="badge badge--idle">Idle</span>
+        </div>
+      </div>
+      <div class="header-actions">
+        <button id="btn-refresh" title="Refresh feed" class="icon-btn">↻</button>
+        <a href="options.html" target="_blank" title="Settings" class="icon-btn">⚙</a>
+      </div>
+    </header>
+
+    <!-- Market Info -->
+    <div id="market-card" class="market-card hidden">
+      <div class="market-label">Watching</div>
+      <div id="market-title" class="market-title">—</div>
+      <div id="market-query" class="market-query"></div>
+      <div id="fetched-at" class="fetched-at"></div>
+    </div>
+
+    <div id="no-market" class="empty-state">
+      <div class="empty-icon">🔍</div>
+      <p>Open a Polymarket event page to see live news updates.</p>
+    </div>
+
+    <!-- Tabs -->
+    <div id="tabs" class="tabs hidden">
+      <button class="tab-btn active" data-tab="news">
+        📰 News <span id="news-count" class="count"></span>
+      </button>
+      <button class="tab-btn" data-tab="reddit">
+        🤖 Reddit <span id="reddit-count" class="count"></span>
+      </button>
+      <button class="tab-btn" data-tab="telegram">
+        ✈ Telegram <span id="telegram-count" class="count"></span>
+      </button>
+    </div>
+
+    <!-- Feed Panels -->
+    <div id="feed-container" class="feed-container hidden">
+      <div id="loading" class="loading hidden">
+        <div class="spinner"></div>
+        <span>Fetching latest news…</span>
+      </div>
+
+      <div id="panel-news" class="panel active" data-panel="news"></div>
+      <div id="panel-reddit" class="panel" data-panel="reddit"></div>
+      <div id="panel-telegram" class="panel" data-panel="telegram"></div>
+    </div>
+  </div>
+
+  <script src="popup.js"></script>
+</body>
+</html>
