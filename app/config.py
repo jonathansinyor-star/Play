@@ -59,6 +59,18 @@ INCIDENT_CLUSTER_WINDOW_SECONDS: int = int(
     os.getenv("INCIDENT_CLUSTER_WINDOW_SECONDS", "1800")
 )
 
+# ─── Polymarket ──────────────────────────────────────────────────────────────
+
+POLYMARKET_API_KEY: str = os.getenv("POLYMARKET_API_KEY", "")
+POLYMARKET_API_SECRET: str = os.getenv("POLYMARKET_API_SECRET", "")
+POLYMARKET_API_PASSPHRASE: str = os.getenv("POLYMARKET_API_PASSPHRASE", "")
+# Your Polygon wallet private key (used to sign CLOB orders – keep secret)
+POLYMARKET_PRIVATE_KEY: str = os.getenv("POLYMARKET_PRIVATE_KEY", "")
+# Fixed USDC amount to bet per signal
+POLYMARKET_TRADE_AMOUNT: float = float(os.getenv("POLYMARKET_TRADE_AMOUNT", "100"))
+# Set to false to disable auto-trading without removing credentials
+POLYMARKET_TRADING_ENABLED: bool = os.getenv("POLYMARKET_TRADING_ENABLED", "true").lower() == "true"
+
 # ─── Notifications ───────────────────────────────────────────────────────────
 
 WEBHOOK_URL: str = os.getenv("WEBHOOK_URL", "")

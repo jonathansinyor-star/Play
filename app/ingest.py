@@ -27,6 +27,7 @@ from typing import Any, Callable, Awaitable
 from app import config
 from app.alerts import send_confirmation_alert, send_early_warning
 from app.classifier import classify
+from app.polymarket import place_yes_bet_today
 from app.clustering import find_or_create_incident
 from app.language import detect_language, needs_translation
 from app.models import AlertEvent, Incident, KeywordMatch, Message, Translation
@@ -248,6 +249,16 @@ async def _process_message(raw: dict[str, Any]) -> None:
                         db_msg_id,
                     )
 
+                    # ── 9b. Polymarket auto-trade ─────────────────────────────
+                    if config.POLYMARKET_TRADING_ENABLED:
+                        asyncio.create_task(
+                            _execute_polymarket_trade(
+                                score=score_result.total,
+                                source_name=source_name,
+                                incident_id=incident.id,
+                            )
+                        )
+
         # ── 10. Confirmation alert ────────────────────────────────────────────
         if incident and score_result.is_confirmation:
             prior_alerts = await get_alerts_for_incident(session, incident.id)
@@ -301,6 +312,43 @@ async def _process_message(raw: dict[str, Any]) -> None:
             await _broadcast_fn(event_data)
         except Exception as exc:
             log.warning("Dashboard broadcast failed: %s", exc)
+
+
+async def _execute_polymarket_trade(
+    score: float, source_name: str, incident_id: int
+) -> None:
+    """Fire-and-forget Polymarket trade triggered by early warning.
+
+    Runs as a background asyncio task so it never blocks the ingest pipeline.
+    """
+    log.info(
+        "Polymarket trade triggered by incident #%d (score=%.1f source='%s')",
+        incident_id,
+        score,
+        source_name,
+    )
+    try:
+        result = await place_yes_bet_today(
+            amount_usdc=config.POLYMARKET_TRADE_AMOUNT,
+            trigger_reason=f"early_warning incident #{incident_id} score={score:.1f}",
+        )
+        if result.get("skipped"):
+            log.info("Polymarket trade skipped – already traded today")
+        elif result.get("success"):
+            log.info(
+                "Polymarket trade SUCCESS – market='%s' amount=$%.2f order=%s",
+                result.get("market_title"),
+                result.get("amount"),
+                result.get("order_response"),
+            )
+        else:
+            log.warning(
+                "Polymarket trade FAILED – error=%s market='%s'",
+                result.get("error"),
+                result.get("market_title"),
+            )
+    except Exception as exc:
+        log.exception("Unexpected error in Polymarket trade task: %s", exc)
 
 
 def _build_confirmation_reason(
