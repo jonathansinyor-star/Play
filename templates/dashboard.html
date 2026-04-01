@@ -1,0 +1,427 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+<title>Beirut Incident Monitor</title>
+<style>
+  :root {
+    --bg: #0d1117; --surface: #161b22; --border: #30363d;
+    --text: #c9d1d9; --text-muted: #8b949e; --accent: #58a6ff;
+    --green: #3fb950; --amber: #d29922; --red: #f85149;
+    --purple: #bc8cff; --early: #d29922; --confirmed: #3fb950;
+    --monitoring: #58a6ff;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { background: var(--bg); color: var(--text); font-family: 'Segoe UI', system-ui, sans-serif; font-size: 13px; }
+  a { color: var(--accent); text-decoration: none; }
+  a:hover { text-decoration: underline; }
+
+  /* Layout */
+  .header { background: var(--surface); border-bottom: 1px solid var(--border); padding: 12px 20px; display: flex; align-items: center; gap: 16px; }
+  .header h1 { font-size: 16px; font-weight: 600; color: #fff; }
+  .header .status-dot { width: 10px; height: 10px; border-radius: 50%; background: var(--green); animation: pulse 2s infinite; }
+  @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:.4} }
+  .header .conn-status { font-size: 11px; color: var(--text-muted); }
+
+  .main { display: grid; grid-template-columns: 1fr 420px; height: calc(100vh - 49px); overflow: hidden; }
+  .left { display: flex; flex-direction: column; border-right: 1px solid var(--border); overflow: hidden; }
+  .right { display: flex; flex-direction: column; overflow: hidden; }
+
+  /* Panels */
+  .panel-header { background: var(--surface); padding: 8px 16px; border-bottom: 1px solid var(--border); display: flex; align-items: center; gap: 8px; font-weight: 600; font-size: 12px; color: var(--text-muted); text-transform: uppercase; letter-spacing: .05em; }
+  .panel-header span.count { background: var(--border); border-radius: 10px; padding: 1px 8px; font-size: 11px; }
+
+  .filters { padding: 8px 12px; background: var(--surface); border-bottom: 1px solid var(--border); display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
+  .filters select, .filters input { background: var(--bg); border: 1px solid var(--border); color: var(--text); padding: 3px 8px; border-radius: 4px; font-size: 12px; }
+  .filters label { font-size: 11px; color: var(--text-muted); }
+  .filters input[type=checkbox] { width: 14px; height: 14px; }
+
+  .feed { flex: 1; overflow-y: auto; }
+  .feed::-webkit-scrollbar { width: 6px; }
+  .feed::-webkit-scrollbar-track { background: var(--bg); }
+  .feed::-webkit-scrollbar-thumb { background: var(--border); border-radius: 3px; }
+
+  /* Message card */
+  .msg-card { padding: 10px 14px; border-bottom: 1px solid var(--border); cursor: default; transition: background .1s; }
+  .msg-card:hover { background: rgba(255,255,255,.03); }
+  .msg-card.relevant { border-left: 3px solid var(--amber); }
+  .msg-card.early-warning { border-left: 3px solid var(--red); }
+  .msg-card.confirmed { border-left: 3px solid var(--green); }
+
+  .msg-meta { display: flex; align-items: center; gap: 8px; margin-bottom: 5px; flex-wrap: wrap; }
+  .msg-source { font-weight: 600; color: var(--accent); font-size: 12px; }
+  .msg-time { color: var(--text-muted); font-size: 11px; }
+  .msg-lang { background: var(--border); border-radius: 3px; padding: 1px 6px; font-size: 10px; text-transform: uppercase; }
+  .msg-score { font-size: 11px; padding: 1px 6px; border-radius: 3px; font-weight: 600; }
+  .msg-score.low { background: #21262d; color: var(--text-muted); }
+  .msg-score.medium { background: #2d2a1e; color: var(--amber); }
+  .msg-score.high { background: #1e2d1e; color: var(--green); }
+  .msg-score.alert { background: #2d1e1e; color: var(--red); }
+  .badge-media { background: #1f2d3d; color: var(--accent); border-radius: 3px; padding: 1px 6px; font-size: 10px; }
+  .badge-fwd { background: var(--border); color: var(--text-muted); border-radius: 3px; padding: 1px 6px; font-size: 10px; }
+
+  .msg-text { color: var(--text); line-height: 1.4; margin-bottom: 4px; word-break: break-word; }
+  .msg-translation { color: var(--text-muted); font-style: italic; line-height: 1.4; font-size: 12px; word-break: break-word; }
+  .msg-translation::before { content: '🔤 '; }
+
+  /* Incident panel */
+  .incidents-list { flex: 1; overflow-y: auto; }
+  .incident-card { padding: 12px 14px; border-bottom: 1px solid var(--border); cursor: pointer; transition: background .1s; }
+  .incident-card:hover { background: rgba(255,255,255,.03); }
+  .incident-card.active { background: rgba(88,166,255,.05); border-left: 3px solid var(--accent); }
+
+  .inc-header { display: flex; align-items: center; gap: 8px; margin-bottom: 6px; }
+  .inc-id { font-weight: 700; color: #fff; font-size: 13px; }
+  .inc-badge { border-radius: 4px; padding: 2px 8px; font-size: 10px; font-weight: 700; text-transform: uppercase; letter-spacing: .05em; }
+  .inc-badge.early_warning { background: #2d2a1e; color: var(--early); border: 1px solid var(--early); }
+  .inc-badge.monitoring  { background: #1a2332; color: var(--monitoring); border: 1px solid var(--monitoring); }
+  .inc-badge.confirmed   { background: #1e2d1e; color: var(--confirmed); border: 1px solid var(--confirmed); }
+
+  .inc-score { margin-left: auto; font-size: 12px; font-weight: 700; }
+  .inc-location { color: var(--text-muted); font-size: 11px; margin-bottom: 4px; }
+  .inc-times { color: var(--text-muted); font-size: 11px; }
+
+  /* Source table */
+  .sources-section { border-top: 1px solid var(--border); max-height: 200px; overflow-y: auto; flex-shrink: 0; }
+  table { width: 100%; border-collapse: collapse; }
+  th { background: var(--surface); padding: 6px 10px; text-align: left; font-size: 11px; color: var(--text-muted); text-transform: uppercase; border-bottom: 1px solid var(--border); position: sticky; top: 0; }
+  td { padding: 5px 10px; font-size: 12px; border-bottom: 1px solid rgba(48,54,61,.5); }
+  .tier-badge { border-radius: 3px; padding: 1px 6px; font-size: 10px; font-weight: 600; }
+  .tier-1 { background: #1e2d1e; color: var(--green); }
+  .tier-2 { background: #2d2a1e; color: var(--amber); }
+  .tier-3 { background: #2d1e1e; color: var(--red); }
+
+  /* Alert toast */
+  #toast-container { position: fixed; top: 60px; right: 20px; z-index: 9999; display: flex; flex-direction: column; gap: 10px; }
+  .toast { background: var(--surface); border: 1px solid var(--border); border-radius: 8px; padding: 14px 18px; max-width: 380px; box-shadow: 0 8px 32px rgba(0,0,0,.5); animation: slideIn .3s ease; }
+  .toast.early_warning { border-color: var(--red); border-left: 4px solid var(--red); }
+  .toast.confirmation  { border-color: var(--green); border-left: 4px solid var(--green); }
+  .toast-title { font-weight: 700; font-size: 13px; margin-bottom: 6px; }
+  .toast.early_warning .toast-title { color: var(--red); }
+  .toast.confirmation  .toast-title { color: var(--green); }
+  .toast-body { font-size: 12px; color: var(--text-muted); line-height: 1.5; }
+  .toast-close { float: right; cursor: pointer; color: var(--text-muted); font-size: 16px; line-height: 1; }
+  @keyframes slideIn { from{transform:translateX(100%);opacity:0} to{transform:translateX(0);opacity:1} }
+
+  /* Misc */
+  .empty-state { text-align: center; color: var(--text-muted); padding: 40px 20px; font-size: 13px; }
+  .highlight { animation: flash 1s ease; }
+  @keyframes flash { 0%{background:rgba(255,165,0,.2)} 100%{background:transparent} }
+  .rtl-text { direction: rtl; text-align: right; unicode-bidi: embed; }
+</style>
+</head>
+<body>
+
+<div class="header">
+  <div class="status-dot" id="connDot"></div>
+  <h1>🔭 Beirut Incident Monitor</h1>
+  <span class="conn-status" id="connLabel">Connecting…</span>
+  <span style="margin-left:auto;color:var(--text-muted);font-size:11px" id="clock"></span>
+</div>
+
+<div class="main">
+  <!-- Left: live message feed -->
+  <div class="left">
+    <div class="panel-header">
+      Live Feed
+      <span class="count" id="msgCount">0</span>
+      <span style="margin-left:auto;font-size:11px;font-weight:400" id="lastUpdate"></span>
+    </div>
+
+    <div class="filters">
+      <label>Lang:
+        <select id="filterLang" onchange="applyFilters()">
+          <option value="">All</option>
+          <option value="ar">Arabic</option>
+          <option value="he">Hebrew</option>
+          <option value="en">English</option>
+        </select>
+      </label>
+      <label>Min score:
+        <input type="number" id="filterScore" value="0" min="0" max="100" step="5" style="width:60px" onchange="applyFilters()"/>
+      </label>
+      <label><input type="checkbox" id="filterRelevant" onchange="applyFilters()"/> Relevant only</label>
+      <label><input type="checkbox" id="filterAlerts" onchange="applyFilters()"/> Alerts only</label>
+    </div>
+
+    <div class="feed" id="msgFeed">
+      <div class="empty-state">Waiting for messages…</div>
+    </div>
+  </div>
+
+  <!-- Right: incidents + sources -->
+  <div class="right">
+    <div class="panel-header">
+      Active Incidents
+      <span class="count" id="incCount">0</span>
+    </div>
+    <div class="incidents-list" id="incidentsList">
+      <div class="empty-state">No incidents yet.</div>
+    </div>
+
+    <div class="sources-section">
+      <div class="panel-header" style="cursor:pointer" onclick="toggleSources()">
+        Source Reliability
+        <span style="margin-left:auto;font-size:12px" id="srcToggle">▲</span>
+      </div>
+      <div id="sourcesTableWrap">
+        <table>
+          <thead><tr><th>Source</th><th>Tier</th><th>Msgs</th><th>Avg Score</th></tr></thead>
+          <tbody id="sourcesBody"><tr><td colspan="4" style="color:var(--text-muted);padding:10px">Loading…</td></tr></tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+</div>
+
+<div id="toast-container"></div>
+
+<script>
+// ── State ─────────────────────────────────────────────────────────────────
+const MAX_MSGS = 500;
+let messages = [];
+let incidents = {};
+let ws = null;
+let reconnectDelay = 1000;
+let incidentHighlight = null;
+
+// Check if we were linked to a specific incident
+const pathMatch = window.location.pathname.match(/\/incidents\/(\d+)/);
+if (pathMatch) incidentHighlight = parseInt(pathMatch[1]);
+
+// ── Clock ─────────────────────────────────────────────────────────────────
+setInterval(() => {
+  document.getElementById('clock').textContent = new Date().toUTCString().slice(0,-4) + 'UTC';
+}, 1000);
+
+// ── WebSocket ─────────────────────────────────────────────────────────────
+function connect() {
+  const proto = location.protocol === 'https:' ? 'wss' : 'ws';
+  ws = new WebSocket(`${proto}://${location.host}/ws`);
+
+  ws.onopen = () => {
+    reconnectDelay = 1000;
+    document.getElementById('connDot').style.background = 'var(--green)';
+    document.getElementById('connLabel').textContent = 'Connected';
+    loadSources();
+  };
+
+  ws.onmessage = (e) => {
+    const data = JSON.parse(e.data);
+    if (data.type === 'ping') return;
+    if (data.type === 'snapshot') {
+      data.incidents.forEach(handleIncident);
+      data.messages.slice(0,50).forEach(m => addMessage(m, false));
+      renderMessages();
+      renderIncidents();
+    } else if (data.type === 'new_message') {
+      addMessage(data, true);
+      renderMessages();
+      document.getElementById('lastUpdate').textContent = 'Updated ' + new Date().toLocaleTimeString();
+    } else if (data.type === 'incident_update') {
+      handleIncident(data);
+      renderIncidents();
+    }
+  };
+
+  ws.onclose = () => {
+    document.getElementById('connDot').style.background = 'var(--red)';
+    document.getElementById('connLabel').textContent = `Reconnecting in ${reconnectDelay/1000}s…`;
+    setTimeout(() => { reconnectDelay = Math.min(reconnectDelay * 2, 30000); connect(); }, reconnectDelay);
+  };
+
+  ws.onerror = () => ws.close();
+}
+
+// ── Message handling ──────────────────────────────────────────────────────
+function addMessage(m, prepend) {
+  if (messages.some(x => x.id === m.id || (x.message_id === m.message_id && x.chat_id === m.chat_id))) return;
+  if (prepend) {
+    messages.unshift(m);
+    if (messages.length > MAX_MSGS) messages.pop();
+  } else {
+    messages.push(m);
+  }
+  // Alert toast for high-score messages
+  if (prepend && m.alert_level) showToast(m);
+}
+
+function getFilters() {
+  return {
+    lang: document.getElementById('filterLang').value,
+    minScore: parseFloat(document.getElementById('filterScore').value) || 0,
+    relevantOnly: document.getElementById('filterRelevant').checked,
+    alertsOnly: document.getElementById('filterAlerts').checked,
+  };
+}
+
+function applyFilters() { renderMessages(); }
+
+function renderMessages() {
+  const {lang, minScore, relevantOnly, alertsOnly} = getFilters();
+  const filtered = messages.filter(m => {
+    if (lang && m.detected_language !== lang) return false;
+    if (m.relevance_score < minScore) return false;
+    if (relevantOnly && !m.is_relevant) return false;
+    if (alertsOnly && !m.alert_level) return false;
+    return true;
+  });
+
+  document.getElementById('msgCount').textContent = filtered.length;
+  const feed = document.getElementById('msgFeed');
+
+  if (filtered.length === 0) {
+    feed.innerHTML = '<div class="empty-state">No messages match current filters.</div>';
+    return;
+  }
+
+  feed.innerHTML = filtered.map(m => buildMsgCard(m)).join('');
+}
+
+function buildMsgCard(m) {
+  const alertClass = m.alert_level === 'confirmation' ? 'confirmed' :
+                     m.alert_level === 'early_warning' ? 'early-warning' :
+                     m.is_relevant ? 'relevant' : '';
+  const score = m.relevance_score || 0;
+  const scoreClass = score >= 70 ? 'alert' : score >= 40 ? 'high' : score >= 15 ? 'medium' : 'low';
+  const lang = m.detected_language || 'unknown';
+  const isRTL = lang === 'ar' || lang === 'he';
+  const time = m.timestamp ? new Date(m.timestamp).toLocaleTimeString() : '';
+  const src = escHtml(m.source_name || m.chat_id || '');
+  const rawText = escHtml(m.raw_text || '');
+  const trans = m.english_translation && m.detected_language !== 'en' ? escHtml(m.english_translation) : '';
+  const mediaTag = m.has_media || m.media_type ? `<span class="badge-media">📷 media</span>` : '';
+  const fwdTag = m.is_forward ? `<span class="badge-fwd">↩ fwd</span>` : '';
+  const incLink = m.incident_id ? `<a href="/incidents/${m.incident_id}" style="font-size:11px;color:var(--text-muted)">inc #${m.incident_id}</a>` : '';
+
+  return `<div class="msg-card ${alertClass}" id="msg-${m.id}">
+    <div class="msg-meta">
+      <span class="msg-source">${src}</span>
+      <span class="msg-time">${time}</span>
+      <span class="msg-lang">${lang}</span>
+      <span class="msg-score ${scoreClass}">${score.toFixed(0)}</span>
+      ${mediaTag}${fwdTag}${incLink}
+    </div>
+    <div class="msg-text${isRTL ? ' rtl-text' : ''}">${rawText || '<em style="color:var(--text-muted)">(media only)</em>'}</div>
+    ${trans ? `<div class="msg-translation">${trans}</div>` : ''}
+  </div>`;
+}
+
+// ── Incident handling ─────────────────────────────────────────────────────
+function handleIncident(i) {
+  incidents[i.id] = i;
+}
+
+function renderIncidents() {
+  const list = document.getElementById('incidentsList');
+  const sorted = Object.values(incidents).sort((a, b) =>
+    new Date(b.last_updated) - new Date(a.last_updated)
+  );
+  document.getElementById('incCount').textContent = sorted.length;
+
+  if (sorted.length === 0) {
+    list.innerHTML = '<div class="empty-state">No incidents yet.</div>';
+    return;
+  }
+
+  list.innerHTML = sorted.map(i => buildIncidentCard(i)).join('');
+
+  if (incidentHighlight) {
+    const el = document.getElementById(`inc-${incidentHighlight}`);
+    if (el) { el.scrollIntoView({behavior:'smooth'}); el.classList.add('active'); }
+  }
+}
+
+function buildIncidentCard(i) {
+  const score = (i.confidence_score || 0).toFixed(0);
+  const scoreColor = score >= 70 ? 'var(--green)' : score >= 40 ? 'var(--amber)' : 'var(--red)';
+  const firstSeen = i.first_seen ? new Date(i.first_seen).toLocaleString() : '';
+  const lastUp = i.last_updated ? new Date(i.last_updated).toLocaleString() : '';
+  return `<div class="incident-card" id="inc-${i.id}" onclick="openIncident(${i.id})">
+    <div class="inc-header">
+      <span class="inc-id">Incident #${i.id}</span>
+      <span class="inc-badge ${i.status}">${i.status.replace('_',' ')}</span>
+      <span class="inc-score" style="color:${scoreColor}">${score}/100</span>
+    </div>
+    <div class="inc-location">📍 ${escHtml(i.location_hint || 'Beirut')}</div>
+    <div class="inc-times">First: ${firstSeen} · Updated: ${lastUp}</div>
+    ${i.notes ? `<div style="color:var(--text-muted);font-size:11px;margin-top:4px">${escHtml(i.notes)}</div>` : ''}
+  </div>`;
+}
+
+async function openIncident(id) {
+  window.history.pushState({}, '', `/incidents/${id}`);
+  incidentHighlight = id;
+  document.querySelectorAll('.incident-card').forEach(el => el.classList.remove('active'));
+  const el = document.getElementById(`inc-${id}`);
+  if (el) el.classList.add('active');
+  // Filter messages to this incident
+  document.getElementById('filterAlerts').checked = false;
+  document.getElementById('filterRelevant').checked = false;
+  // Scroll feed to first message for this incident
+  const firstMsg = messages.find(m => m.incident_id === id);
+  if (firstMsg) {
+    renderMessages();
+    setTimeout(() => {
+      const el = document.getElementById(`msg-${firstMsg.id}`);
+      if (el) { el.scrollIntoView({behavior:'smooth'}); el.classList.add('highlight'); }
+    }, 100);
+  }
+}
+
+// ── Sources table ─────────────────────────────────────────────────────────
+async function loadSources() {
+  try {
+    const resp = await fetch('/api/sources');
+    const data = await resp.json();
+    const tbody = document.getElementById('sourcesBody');
+    if (!data.length) { tbody.innerHTML = '<tr><td colspan="4" style="color:var(--text-muted);padding:10px">No sources configured.</td></tr>'; return; }
+    tbody.innerHTML = data.map(s => `
+      <tr>
+        <td>${escHtml(s.name)}</td>
+        <td><span class="tier-badge tier-${s.trust_tier}">Tier ${s.trust_tier}</span></td>
+        <td>${s.message_count}</td>
+        <td>${s.avg_score}</td>
+      </tr>`).join('');
+  } catch(e) { console.warn('Failed to load sources', e); }
+}
+
+function toggleSources() {
+  const wrap = document.getElementById('sourcesTableWrap');
+  const btn = document.getElementById('srcToggle');
+  if (wrap.style.display === 'none') { wrap.style.display = ''; btn.textContent = '▲'; }
+  else { wrap.style.display = 'none'; btn.textContent = '▼'; }
+}
+
+// ── Toast alerts ──────────────────────────────────────────────────────────
+function showToast(m) {
+  const container = document.getElementById('toast-container');
+  const div = document.createElement('div');
+  div.className = `toast ${m.alert_level}`;
+  const title = m.alert_level === 'confirmation' ? '✅ CONFIRMED: Beirut Incident' : '🚨 EARLY WARNING: Possible Beirut Incident';
+  const src = escHtml(m.source_name || '');
+  const text = escHtml((m.english_translation || m.raw_text || '').slice(0, 200));
+  const score = (m.relevance_score || 0).toFixed(0);
+  div.innerHTML = `
+    <span class="toast-close" onclick="this.parentElement.remove()">×</span>
+    <div class="toast-title">${title}</div>
+    <div class="toast-body">
+      <strong>${src}</strong> · Score: ${score}<br>
+      ${text}
+      ${m.incident_id ? `<br><a href="/incidents/${m.incident_id}">View incident #${m.incident_id} →</a>` : ''}
+    </div>`;
+  container.prepend(div);
+  setTimeout(() => { if (div.parentElement) div.remove(); }, 15000);
+}
+
+// ── Utility ───────────────────────────────────────────────────────────────
+function escHtml(str) {
+  return String(str).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+}
+
+// ── Init ──────────────────────────────────────────────────────────────────
+connect();
+</script>
+</body>
+</html>

@@ -1,0 +1,128 @@
+# ─── Telegram Sources Configuration ─────────────────────────────────────────
+#
+# How to add a channel:
+#   1. Find the channel's Telegram username (e.g. @Lebanon24) or numeric chat ID.
+#   2. Add an entry below with the fields shown.
+#   3. Set enabled: true to monitor it on next startup.
+#   4. Assign a trust_tier (1 = most reliable, 3 = rumor/community).
+#
+# Fields:
+#   name        – Human-readable display name (used in alerts and dashboard)
+#   username    – Telegram @username WITHOUT the @ (used to resolve chat_id)
+#   chat_id     – Numeric chat ID (optional; if provided, username is ignored)
+#   trust_tier  – 1 | 2 | 3  (see README for scoring impact)
+#   language    – Primary language hint: ar | he | en | mixed
+#   enabled     – true | false
+#   notes       – Free-text description (not used by the app)
+#
+# ─── Tier 1 – Official / Institutional / Highly Reliable ────────────────────
+sources:
+
+  - name: "Lebanese Civil Defense"
+    username: "LebCivilDefense"
+    chat_id: null
+    trust_tier: 1
+    language: "ar"
+    enabled: true
+    notes: "Official Lebanese Civil Defense announcements"
+
+  - name: "Lebanon 24 News"
+    username: "Lebanon24"
+    chat_id: null
+    trust_tier: 1
+    language: "ar"
+    enabled: true
+    notes: "Major Lebanese news outlet"
+
+  - name: "LBCI Lebanon"
+    username: "LBCILebanon"
+    chat_id: null
+    trust_tier: 1
+    language: "ar"
+    enabled: true
+    notes: "Lebanese Broadcasting Corporation International"
+
+# ─── Tier 2 – Established OSINT / War-monitoring ────────────────────────────
+
+  - name: "Intel Slava Z"
+    username: "intelslava"
+    chat_id: null
+    trust_tier: 2
+    language: "en"
+    enabled: true
+    notes: "Active war/OSINT monitoring channel"
+
+  - name: "OSINTdefender"
+    username: "OSINTdefender"
+    chat_id: null
+    trust_tier: 2
+    language: "en"
+    enabled: true
+    notes: "OSINT conflict tracker"
+
+  - name: "Qinetiq OSINT"
+    username: "Conflicts_Worldwide"
+    chat_id: null
+    trust_tier: 2
+    language: "en"
+    enabled: true
+    notes: "Global conflict monitoring"
+
+  - name: "Middle East Eye"
+    username: "MiddleEastEye"
+    chat_id: null
+    trust_tier: 2
+    language: "en"
+    enabled: true
+    notes: "Regional news outlet"
+
+  - name: "Al Manar"
+    username: "almanarnews"
+    chat_id: null
+    trust_tier: 2
+    language: "ar"
+    enabled: true
+    notes: "Lebanese Hezbollah-affiliated broadcaster"
+
+  - name: "Al Jadeed"
+    username: "AlJadeedTV"
+    chat_id: null
+    trust_tier: 2
+    language: "ar"
+    enabled: true
+    notes: "Lebanese TV channel with breaking news"
+
+# ─── Tier 3 – Fast rumor / Community channels ────────────────────────────────
+
+  - name: "Beirut Today"
+    username: "beiruttoday"
+    chat_id: null
+    trust_tier: 3
+    language: "en"
+    enabled: true
+    notes: "English-language Beirut community news"
+
+  - name: "Lebanon News Community"
+    username: "LebanonNewsAr"
+    chat_id: null
+    trust_tier: 3
+    language: "ar"
+    enabled: true
+    notes: "Community-sourced Arabic Lebanon news"
+
+  - name: "Dahiyeh Updates"
+    username: "DahiyehUpdates"
+    chat_id: null
+    trust_tier: 3
+    language: "ar"
+    enabled: true
+    notes: "Southern Beirut suburb community reports"
+
+# ─── Example: add your own source ────────────────────────────────────────────
+# - name: "My Custom Source"
+#   username: "mychannelusername"
+#   chat_id: null          # or -1001234567890
+#   trust_tier: 2
+#   language: "mixed"
+#   enabled: false
+#   notes: "Add notes here"

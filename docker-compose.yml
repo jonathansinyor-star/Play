@@ -1,0 +1,40 @@
+version: "3.9"
+
+services:
+  beirut-monitor:
+    build: .
+    image: beirut-monitor:latest
+    container_name: beirut_monitor
+
+    # Load all secrets from .env file
+    env_file:
+      - .env
+
+    # Override DB path to use the mounted volume
+    environment:
+      - DB_URL=sqlite+aiosqlite:////app/data/incidents.db
+      - TELEGRAM_SESSION_PATH=/app/data/beirut_monitor
+
+    ports:
+      - "${DASHBOARD_PORT:-8080}:8080"
+
+    volumes:
+      # Persist SQLite database and Telegram session across restarts
+      - ./data:/app/data
+      # Hot-reload sources config without rebuilding
+      - ./sources.yaml:/app/sources.yaml:ro
+
+    restart: unless-stopped
+
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8080/api/sources')"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 20s
+
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
