@@ -44,10 +44,92 @@ sources:
 
 # ─── Tier 2 – Established OSINT / War-monitoring ────────────────────────────
 
+  - name: "מבזקי רעם (Ram Reports)"
+    username: "ramreports"
+    chat_id: null
+    trust_tier: 1
+    language: "he"
+    enabled: true
+    notes: "Hebrew breaking news, 197k subscribers"
+
+  - name: "החדשות החמות (Hot News)"
+    username: "hotnews1"
+    chat_id: null
+    trust_tier: 1
+    language: "he"
+    enabled: true
+    notes: "Hebrew news channel, 81k subscribers"
+
+  - name: "Ramallah Mix"
+    username: "ramallahmix1"
+    chat_id: null
+    trust_tier: 1
+    language: "ar"
+    enabled: true
+    notes: "Arabic news, 357k subscribers"
+
+  - name: "ללא צנזורה חדשות ישראל (Uncensored Israel News)"
+    username: "Tisraelnewss"
+    chat_id: null
+    trust_tier: 1
+    language: "he"
+    enabled: true
+    notes: "Uncensored Hebrew Israel news, 85k subscribers"
+
+# ─── Tier 3 – Fast rumor / Community channels ────────────────────────────────
+
+  - name: "عش الدبابير مخيم جنين (Jenin Camp)"
+    username: "jeniincamp"
+    chat_id: null
+    trust_tier: 1
+    language: "ar"
+    enabled: true
+    notes: "Arabic community channel Jenin camp, 226k subscribers"
+
+  - name: "חדשות 301 העולם הערבי (Arab World 301)"
+    username: "arabworld301news"
+    chat_id: null
+    trust_tier: 1
+    language: "he"
+    enabled: true
+    notes: "Hebrew intel/security channel, 183k subscribers"
+
+  - name: "אבו צאלח הדסק הערבי (Abu Saleh Arab Desk)"
+    username: "salehdesk1"
+    chat_id: null
+    trust_tier: 1
+    language: "he"
+    enabled: true
+    notes: "Hebrew Arab world desk, 193k subscribers"
+
+  - name: "חַנַּנְאֵל אָבִיב (Hananel Aviv)"
+    username: "b3976a"
+    chat_id: null
+    trust_tier: 1
+    language: "he"
+    enabled: true
+    notes: "Hebrew security/intel analysis, 25k subscribers"
+
+  - name: "מناقشات عش الدبابير (Jenin Camp Discussions)"
+    username: "Jenin2camp"
+    chat_id: null
+    trust_tier: 1
+    language: "ar"
+    enabled: true
+    notes: "Arabic Jenin camp discussion group, 39k members"
+
+  - name: "אבו עלי אקספרס (Abu Ali Express)"
+    username: "abualiexpress"
+    chat_id: null
+    trust_tier: 1
+    language: "ar"
+    enabled: true
+    notes: "Arabic breaking news, 599k subscribers"
+
   - name: "Intel Slava Z"
     username: "intelslava"
     chat_id: null
-    trust_tier: 2
+    trust_tier: 1
     language: "en"
     enabled: true
     notes: "Active war/OSINT monitoring channel"
@@ -55,7 +137,7 @@ sources:
   - name: "OSINTdefender"
     username: "OSINTdefender"
     chat_id: null
-    trust_tier: 2
+    trust_tier: 1
     language: "en"
     enabled: true
     notes: "OSINT conflict tracker"
@@ -63,7 +145,7 @@ sources:
   - name: "Qinetiq OSINT"
     username: "Conflicts_Worldwide"
     chat_id: null
-    trust_tier: 2
+    trust_tier: 1
     language: "en"
     enabled: true
     notes: "Global conflict monitoring"
@@ -71,7 +153,7 @@ sources:
   - name: "Middle East Eye"
     username: "MiddleEastEye"
     chat_id: null
-    trust_tier: 2
+    trust_tier: 1
     language: "en"
     enabled: true
     notes: "Regional news outlet"
@@ -79,7 +161,7 @@ sources:
   - name: "Al Manar"
     username: "almanarnews"
     chat_id: null
-    trust_tier: 2
+    trust_tier: 1
     language: "ar"
     enabled: true
     notes: "Lebanese Hezbollah-affiliated broadcaster"
@@ -87,7 +169,7 @@ sources:
   - name: "Al Jadeed"
     username: "AlJadeedTV"
     chat_id: null
-    trust_tier: 2
+    trust_tier: 1
     language: "ar"
     enabled: true
     notes: "Lebanese TV channel with breaking news"
@@ -97,7 +179,7 @@ sources:
   - name: "Beirut Today"
     username: "beiruttoday"
     chat_id: null
-    trust_tier: 3
+    trust_tier: 1
     language: "en"
     enabled: true
     notes: "English-language Beirut community news"
@@ -105,7 +187,7 @@ sources:
   - name: "Lebanon News Community"
     username: "LebanonNewsAr"
     chat_id: null
-    trust_tier: 3
+    trust_tier: 1
     language: "ar"
     enabled: true
     notes: "Community-sourced Arabic Lebanon news"
@@ -113,7 +195,7 @@ sources:
   - name: "Dahiyeh Updates"
     username: "DahiyehUpdates"
     chat_id: null
-    trust_tier: 3
+    trust_tier: 1
     language: "ar"
     enabled: true
     notes: "Southern Beirut suburb community reports"
@@ -122,7 +204,7 @@ sources:
 # - name: "My Custom Source"
 #   username: "mychannelusername"
 #   chat_id: null          # or -1001234567890
-#   trust_tier: 2
+#   trust_tier: 1
 #   language: "mixed"
 #   enabled: false
 #   notes: "Add notes here"
