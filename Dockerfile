@@ -31,7 +31,4 @@ ENV PYTHONUNBUFFERED=1 \
 
 EXPOSE 8080
 
-# Persistent data volume (SQLite DB + Telegram session file)
-VOLUME ["/app/data"]
-
 CMD ["python", "-m", "app.main"]
