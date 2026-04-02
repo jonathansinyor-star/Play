@@ -60,32 +60,7 @@ async def main() -> None:
     # Wire up the broadcast function so ingest can push to dashboard WS clients
     set_broadcast_fn(broadcast_event)
 
-    # ── Telegram client ───────────────────────────────────────────────────────
-    tg_client = TelegramMonitorClient(queue)
-    try:
-        await tg_client.start()
-    except Exception as exc:
-        log.error("Failed to start Telegram client: %s", exc)
-        log.error(
-            "Make sure TELEGRAM_API_ID, TELEGRAM_API_HASH, and TELEGRAM_PHONE are set in .env"
-        )
-        sys.exit(1)
-
-    # Wire Telegram client into alerts module for DM sending
-    set_telegram_client(tg_client)
-
-    # Resolve channel usernames → chat IDs and register watchers
-    resolved = await tg_client.join_sources(enabled)
-    log.info("Watching %d channel(s): %s", len(resolved), list(resolved.keys()))
-
-    # Update sources in DB with resolved chat IDs
-    async with session_scope() as session:
-        for src in enabled:
-            if src.name in resolved:
-                src.chat_id = resolved[src.name]
-            await upsert_source(session, src)
-
-    # ── Dashboard server ──────────────────────────────────────────────────────
+    # ── Dashboard server (starts immediately, regardless of Telegram status) ──
     uvicorn_config = uvicorn.Config(
         app=dashboard_app,
         host=config.DASHBOARD_HOST,
@@ -95,10 +70,29 @@ async def main() -> None:
     )
     uvicorn_server = uvicorn.Server(uvicorn_config)
 
-    # ── Run all tasks concurrently ────────────────────────────────────────────
+    # ── Telegram client (non-fatal if it fails) ───────────────────────────────
+    tg_client = TelegramMonitorClient(queue)
+    tg_connected = False
+    try:
+        await tg_client.start()
+        tg_connected = True
+        set_telegram_client(tg_client)
+        resolved = await tg_client.join_sources(enabled)
+        log.info("Watching %d channel(s): %s", len(resolved), list(resolved.keys()))
+        async with session_scope() as session:
+            for src in enabled:
+                if src.name in resolved:
+                    src.chat_id = resolved[src.name]
+                await upsert_source(session, src)
+    except Exception as exc:
+        log.error("Telegram client failed to start: %s", exc)
+        log.warning("Dashboard will run without Telegram monitoring – retrying is not automatic")
+
+    # ── Run tasks concurrently ────────────────────────────────────────────────
     async def _shutdown(signum, loop):
         log.info("Shutting down (signal %s)…", signum)
-        await tg_client.stop()
+        if tg_connected:
+            await tg_client.stop()
         uvicorn_server.should_exit = True
 
     loop = asyncio.get_running_loop()
@@ -114,11 +108,11 @@ async def main() -> None:
         config.DASHBOARD_PORT,
     )
 
-    await asyncio.gather(
-        tg_client.run_until_disconnected(),
-        run_pipeline(queue),
-        uvicorn_server.serve(),
-    )
+    tasks = [run_pipeline(queue), uvicorn_server.serve()]
+    if tg_connected:
+        tasks.append(tg_client.run_until_disconnected())
+
+    await asyncio.gather(*tasks)
 
 
 if __name__ == "__main__":
