@@ -19,8 +19,6 @@ from typing import Any
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Query, HTTPException
 from fastapi.responses import HTMLResponse
-from fastapi.staticfiles import StaticFiles
-from fastapi.templating import Jinja2Templates
 from fastapi.requests import Request
 
 from app import config
@@ -37,8 +35,11 @@ log = logging.getLogger(__name__)
 
 app = FastAPI(title="Beirut Incident Monitor", version="1.0.0")
 
-_TEMPLATES_DIR = Path(__file__).resolve().parent.parent / "templates"
-templates = Jinja2Templates(directory=str(_TEMPLATES_DIR))
+_DASHBOARD_HTML = Path(__file__).resolve().parent.parent / "templates" / "dashboard.html"
+
+
+def _read_dashboard_html() -> str:
+    return _DASHBOARD_HTML.read_text(encoding="utf-8")
 
 # ─── WebSocket connection manager ────────────────────────────────────────────
 
@@ -81,16 +82,13 @@ async def broadcast_event(data: dict[str, Any]) -> None:
 # ─── Routes ──────────────────────────────────────────────────────────────────
 
 @app.get("/", response_class=HTMLResponse)
-async def dashboard_home(request: Request):
-    return templates.TemplateResponse("dashboard.html", {"request": request})
+async def dashboard_home():
+    return HTMLResponse(content=_read_dashboard_html())
 
 
 @app.get("/incidents/{incident_id}", response_class=HTMLResponse)
-async def incident_detail_page(request: Request, incident_id: int):
-    return templates.TemplateResponse(
-        "dashboard.html",
-        {"request": request, "highlight_incident_id": incident_id},
-    )
+async def incident_detail_page(incident_id: int):
+    return HTMLResponse(content=_read_dashboard_html())
 
 
 @app.websocket("/ws")
