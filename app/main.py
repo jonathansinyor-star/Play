@@ -21,6 +21,7 @@ import uvicorn
 
 from app import config
 from app.alerts import set_telegram_client
+from app.auth import register_auth_routes
 from app.dashboard import app as dashboard_app, broadcast_event
 from app.ingest import run_pipeline, set_broadcast_fn
 from app.storage import get_session_factory, init_db, session_scope, upsert_source
@@ -59,6 +60,9 @@ async def main() -> None:
 
     # Wire up the broadcast function so ingest can push to dashboard WS clients
     set_broadcast_fn(broadcast_event)
+
+    # Register auth routes (for first-time Telegram login via browser)
+    register_auth_routes(dashboard_app)
 
     # ── Dashboard server (starts immediately, regardless of Telegram status) ──
     uvicorn_config = uvicorn.Config(

@@ -50,7 +50,15 @@ class TelegramMonitorClient:
             config.TELEGRAM_API_ID,
             config.TELEGRAM_API_HASH,
         )
-        await self._client.start(phone=config.TELEGRAM_PHONE)
+
+        # If a session file already exists, connect directly (no code needed)
+        session_file = Path(config.TELEGRAM_SESSION_PATH + ".session")
+        if session_file.exists():
+            await self._client.start(phone=config.TELEGRAM_PHONE)
+        else:
+            # New session — need interactive code via web auth page
+            await self._start_with_web_auth()
+
         log.info("Telegram client connected as %s", await self._client.get_me())
 
         @self._client.on(events.NewMessage)
@@ -58,6 +66,31 @@ class TelegramMonitorClient:
             await self._handle_event(event)
 
         log.info("NewMessage handler registered")
+
+    async def _start_with_web_auth(self) -> None:
+        """Start Telethon using a web-based code input instead of stdin."""
+        import asyncio
+        from app.auth import set_pending_client, mark_auth_success, mark_auth_error
+
+        loop = asyncio.get_event_loop()
+        code_future: asyncio.Future = loop.create_future()
+
+        async def _code_callback():
+            log.info("Waiting for verification code via web at /auth ...")
+            set_pending_client(self._client, code_future)
+            code = await code_future
+            log.info("Received verification code from web")
+            return code
+
+        try:
+            await self._client.start(
+                phone=config.TELEGRAM_PHONE,
+                code_callback=_code_callback,
+            )
+            mark_auth_success()
+        except Exception as exc:
+            mark_auth_error(str(exc))
+            raise
 
     async def stop(self) -> None:
         if self._client:
