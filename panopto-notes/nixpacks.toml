@@ -1,2 +1,5 @@
 [phases.setup]
-nixPkgs = ["ffmpeg"]
+nixPkgs = ["ffmpeg", "python312"]
+
+[variables]
+NIXPACKS_PYTHON_VERSION = "3.12"
