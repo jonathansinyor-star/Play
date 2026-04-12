@@ -1,5 +1,5 @@
 [phases.setup]
-nixPkgs = ["ffmpeg", "python312"]
+nixPkgs = ["ffmpeg"]
 
-[variables]
-NIXPACKS_PYTHON_VERSION = "3.12"
+[phases.install]
+cmds = ["pip install -r requirements.txt && python -m playwright install --with-deps chromium"]

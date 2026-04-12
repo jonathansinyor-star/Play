@@ -17,86 +17,103 @@ PANOPTO_BASE = "https://tau.cloud.panopto.eu"
 SINCE_DATE = "2026-03-01T00:00:00.000Z"
 NOTES_DIR = tempfile.gettempdir()
 
+# Discovered API base path (set after first successful API call)
+_api_base = None
+
 # ---------------------------------------------------------------------------
-# Auth helpers
+# Auth helpers — uses Playwright headless browser for JS-heavy SSO
 # ---------------------------------------------------------------------------
 
 def _build_panopto_session():
+    from playwright.sync_api import sync_playwright
+
     moodle_url = os.environ["MOODLE_URL"].rstrip("/")
     username = os.environ["MOODLE_USERNAME"]
     id_number = os.environ.get("MOODLE_ID", "")
     password = os.environ["MOODLE_PASSWORD"]
 
-    s = req.Session()
-    s.headers["User-Agent"] = (
-        "Mozilla/5.0 (iPad; CPU OS 17_0 like Mac OS X) "
-        "AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1"
-    )
+    with sync_playwright() as p:
+        browser = p.chromium.launch(
+            headless=True,
+            args=["--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu"],
+        )
+        context = browser.new_context()
 
-    # 1. Navigate to Moodle login — TAU redirects to nidp.tau.ac.il SSO
-    r = s.get(f"{moodle_url}/login/index.php", timeout=20, allow_redirects=True)
-    soup = BeautifulSoup(r.text, "html.parser")
-    form = soup.find("form")
+        # Intercept API calls to discover correct API path
+        discovered_api = []
+        def on_request(req_obj):
+            url = req_obj.url
+            if "panopto" in url and "/api/" in url:
+                discovered_api.append(url)
+        context.on("request", on_request)
 
-    if form:
-        from urllib.parse import urljoin
-        action = form.get("action", r.url)
-        if not action.startswith("http"):
-            action = urljoin(r.url, action)
+        page = context.new_page()
 
-        # Collect all existing hidden fields
-        data = {}
-        for inp in form.find_all("input"):
-            name = inp.get("name")
-            if name:
-                data[name] = inp.get("value", "")
+        # 1. Navigate to Moodle — follows redirect to nidp.tau.ac.il SSO
+        page.goto(f"{moodle_url}/login/index.php", wait_until="domcontentloaded", timeout=30000)
+        page.wait_for_load_state("networkidle", timeout=15000)
 
-        # Fill username, ID, password by inspecting each field's name/placeholder
-        for inp in form.find_all("input"):
-            name = inp.get("name", "")
-            itype = inp.get("type", "text").lower()
-            placeholder = inp.get("placeholder", "")
-
+        # 2. Fill login form (works for nidp.tau.ac.il 3-field form)
+        page.wait_for_selector("input", timeout=10000)
+        inputs = page.query_selector_all("input:not([type='hidden']):not([type='submit'])")
+        for inp in inputs:
+            itype = (inp.get_attribute("type") or "text").lower()
+            placeholder = inp.get_attribute("placeholder") or ""
+            name = (inp.get_attribute("name") or "").lower()
             if itype == "password":
-                data[name] = password
-            elif any(k in name.lower() for k in ("user", "login", "name")):
-                data[name] = username
-            elif any(k in name.lower() for k in ("id", "identity", "zehu", "zehut")):
-                data[name] = id_number
-            elif any(k in placeholder for k in ("משתמש", "user", "User")):
-                data[name] = username
-            elif any(k in placeholder for k in ("זהות", "identity", "ID", "id")):
-                data[name] = id_number
+                inp.fill(password)
+            elif any(k in placeholder for k in ("משתמש", "user", "User", "username")) \
+                    or any(k in name for k in ("user", "login")):
+                inp.fill(username)
+            elif any(k in placeholder for k in ("זהות", "identity", "id", "ID")) \
+                    or any(k in name for k in ("id", "identity")):
+                inp.fill(id_number)
 
-        # POST to SSO form
-        r = s.post(action, data=data, timeout=30, allow_redirects=True)
+        # Click submit
+        page.click("button[type='submit'], input[type='submit']")
+        page.wait_for_load_state("networkidle", timeout=20000)
 
-        # If there's a SAML response form to auto-submit, follow it
-        soup2 = BeautifulSoup(r.text, "html.parser")
-        saml_form = soup2.find("form")
-        if saml_form and saml_form.get("action"):
-            saml_action = saml_form["action"]
-            saml_data = {}
-            for inp in saml_form.find_all("input"):
-                if inp.get("name"):
-                    saml_data[inp["name"]] = inp.get("value", "")
-            s.post(saml_action, data=saml_data, timeout=30, allow_redirects=True)
+        # 3. Navigate to Panopto via Moodle SSO
+        for cas in ("MOODLE", "Moodle", "LTI"):
+            try:
+                page.goto(
+                    f"{PANOPTO_BASE}/Panopto/Pages/Auth/Login.aspx?authCAS={cas}",
+                    wait_until="networkidle", timeout=20000,
+                )
+                if "panopto" in page.url:
+                    break
+            except Exception:
+                continue
 
-    # 2. Trigger Panopto SSO – try common auth URL variants
-    auth_variants = [
-        f"{PANOPTO_BASE}/Panopto/Pages/Auth/Login.aspx?authCAS=MOODLE",
-        f"{PANOPTO_BASE}/Panopto/Pages/Auth/Login.aspx?authCAS=Moodle",
-        f"{PANOPTO_BASE}/Panopto/Pages/Auth/Login.aspx?authCAS=LTI",
-    ]
-    for auth_url in auth_variants:
+        # 4. Visit Shared With Me page to trigger API calls and discover endpoints
         try:
-            r = s.get(auth_url, timeout=30, allow_redirects=True)
-            check = s.get(f"{PANOPTO_BASE}/Panopto/api/v1/auth/legacyLogin", timeout=10)
-            if check.status_code != 401:
-                break
+            page.goto(
+                f"{PANOPTO_BASE}/Panopto/Pages/Sessions/List.aspx#isSharedWithMe=true",
+                wait_until="networkidle", timeout=20000,
+            )
         except Exception:
-            continue
+            pass
 
+        # 5. Extract cookies for the Panopto domain
+        all_cookies = context.cookies()
+        browser.close()
+
+    # Store discovered API path
+    global _api_base
+    for url in discovered_api:
+        m = re.search(r"(https?://[^/]+/Panopto/api/[^/]+)/", url)
+        if m:
+            _api_base = m.group(1)
+            break
+    if not _api_base:
+        _api_base = f"{PANOPTO_BASE}/Panopto/api/v1"
+
+    # Build requests.Session with extracted cookies
+    s = req.Session()
+    s.headers["User-Agent"] = "Mozilla/5.0"
+    for c in all_cookies:
+        if "panopto" in c.get("domain", ""):
+            s.cookies.set(c["name"], c["value"], domain=c["domain"])
     return s
 
 
@@ -111,6 +128,8 @@ def get_session():
 
 def reset_session():
     app._panopto_session = None
+    global _api_base
+    _api_base = None
 
 
 # ---------------------------------------------------------------------------
@@ -119,6 +138,7 @@ def reset_session():
 
 def list_shared_sessions():
     s = get_session()
+    base = _api_base or f"{PANOPTO_BASE}/Panopto/api/v1"
     params = {
         "isSharedWithMe": "true",
         "sortField": "StartTime",
@@ -126,11 +146,11 @@ def list_shared_sessions():
         "pagination[maxResults]": 100,
         "minStartDate": SINCE_DATE,
     }
-    r = s.get(f"{PANOPTO_BASE}/Panopto/api/v1/sessions", params=params, timeout=30)
+    r = s.get(f"{base}/sessions", params=params, timeout=30)
     if r.status_code == 401:
         reset_session()
         s = get_session()
-        r = s.get(f"{PANOPTO_BASE}/Panopto/api/v1/sessions", params=params, timeout=30)
+        r = s.get(f"{base}/sessions", params=params, timeout=30)
     data = r.json()
     results = data.get("Results", [])
     # Filter by date client-side as a safety net
@@ -149,7 +169,8 @@ def list_shared_sessions():
 
 def get_session_detail(session_id):
     s = get_session()
-    r = s.get(f"{PANOPTO_BASE}/Panopto/api/v1/sessions/{session_id}", timeout=20)
+    base = _api_base or f"{PANOPTO_BASE}/Panopto/api/v1"
+    r = s.get(f"{base}/sessions/{session_id}", timeout=20)
     return r.json()
 
 
