@@ -9,7 +9,6 @@ from flask import Flask, request, session, Response, send_file, redirect, url_fo
 import requests as req
 from bs4 import BeautifulSoup
 from groq import Groq
-from pydub import AudioSegment
 
 app = Flask(__name__)
 app.secret_key = os.environ.get("SECRET_KEY", "change-me-in-railway")
@@ -174,25 +173,36 @@ def download_and_transcribe(session_id, download_url, caption_url):
                 for chunk in r.iter_content(chunk_size=1024 * 1024):
                     out.write(chunk)
 
-        # Extract audio at 64kbps to keep size small
+        # Extract audio at 64kbps mono 16kHz to keep size small
         subprocess.run(
             ["ffmpeg", "-y", "-i", tmp_mp4, "-vn", "-ar", "16000", "-ac", "1", "-ab", "64k", tmp_mp3],
             check=True, capture_output=True,
         )
 
-        # Split into <20MB chunks for Groq's 25MB limit
-        audio = AudioSegment.from_mp3(tmp_mp3)
+        # Get duration in seconds via ffprobe
+        probe = subprocess.run(
+            ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+             "-of", "default=noprint_wrappers=1:nokey=1", tmp_mp3],
+            capture_output=True, text=True, check=True,
+        )
+        total_seconds = float(probe.stdout.strip())
         file_size = os.path.getsize(tmp_mp3)
+
+        # Split into <20MB chunks for Groq's 25MB limit using ffmpeg
         max_bytes = 20 * 1024 * 1024
         num_chunks = math.ceil(file_size / max_bytes)
-        chunk_len_ms = math.ceil(len(audio) / num_chunks)
+        chunk_seconds = math.ceil(total_seconds / num_chunks)
 
         transcript_parts = []
         for i in range(num_chunks):
-            chunk = audio[i * chunk_len_ms : (i + 1) * chunk_len_ms]
+            start = i * chunk_seconds
             with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as cf:
                 chunk_path = cf.name
-            chunk.export(chunk_path, format="mp3", bitrate="64k")
+            subprocess.run(
+                ["ffmpeg", "-y", "-i", tmp_mp3, "-ss", str(start),
+                 "-t", str(chunk_seconds), "-c", "copy", chunk_path],
+                check=True, capture_output=True,
+            )
             try:
                 with open(chunk_path, "rb") as audio_file:
                     result = groq_client.audio.transcriptions.create(
