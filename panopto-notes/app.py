@@ -24,6 +24,7 @@ NOTES_DIR = tempfile.gettempdir()
 def _build_panopto_session():
     moodle_url = os.environ["MOODLE_URL"].rstrip("/")
     username = os.environ["MOODLE_USERNAME"]
+    id_number = os.environ.get("MOODLE_ID", "")
     password = os.environ["MOODLE_PASSWORD"]
 
     s = req.Session()
@@ -32,21 +33,56 @@ def _build_panopto_session():
         "AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1"
     )
 
-    # 1. Fetch Moodle login page to get the logintoken
-    r = s.get(f"{moodle_url}/login/index.php", timeout=20)
+    # 1. Navigate to Moodle login — TAU redirects to nidp.tau.ac.il SSO
+    r = s.get(f"{moodle_url}/login/index.php", timeout=20, allow_redirects=True)
     soup = BeautifulSoup(r.text, "html.parser")
-    token_input = soup.find("input", {"name": "logintoken"})
-    logintoken = token_input["value"] if token_input else ""
+    form = soup.find("form")
 
-    # 2. POST credentials to Moodle
-    s.post(
-        f"{moodle_url}/login/index.php",
-        data={"username": username, "password": password, "logintoken": logintoken},
-        timeout=20,
-        allow_redirects=True,
-    )
+    if form:
+        from urllib.parse import urljoin
+        action = form.get("action", r.url)
+        if not action.startswith("http"):
+            action = urljoin(r.url, action)
 
-    # 3. Trigger Panopto SSO – try common auth URL variants
+        # Collect all existing hidden fields
+        data = {}
+        for inp in form.find_all("input"):
+            name = inp.get("name")
+            if name:
+                data[name] = inp.get("value", "")
+
+        # Fill username, ID, password by inspecting each field's name/placeholder
+        for inp in form.find_all("input"):
+            name = inp.get("name", "")
+            itype = inp.get("type", "text").lower()
+            placeholder = inp.get("placeholder", "")
+
+            if itype == "password":
+                data[name] = password
+            elif any(k in name.lower() for k in ("user", "login", "name")):
+                data[name] = username
+            elif any(k in name.lower() for k in ("id", "identity", "zehu", "zehut")):
+                data[name] = id_number
+            elif any(k in placeholder for k in ("משתמש", "user", "User")):
+                data[name] = username
+            elif any(k in placeholder for k in ("זהות", "identity", "ID", "id")):
+                data[name] = id_number
+
+        # POST to SSO form
+        r = s.post(action, data=data, timeout=30, allow_redirects=True)
+
+        # If there's a SAML response form to auto-submit, follow it
+        soup2 = BeautifulSoup(r.text, "html.parser")
+        saml_form = soup2.find("form")
+        if saml_form and saml_form.get("action"):
+            saml_action = saml_form["action"]
+            saml_data = {}
+            for inp in saml_form.find_all("input"):
+                if inp.get("name"):
+                    saml_data[inp["name"]] = inp.get("value", "")
+            s.post(saml_action, data=saml_data, timeout=30, allow_redirects=True)
+
+    # 2. Trigger Panopto SSO – try common auth URL variants
     auth_variants = [
         f"{PANOPTO_BASE}/Panopto/Pages/Auth/Login.aspx?authCAS=MOODLE",
         f"{PANOPTO_BASE}/Panopto/Pages/Auth/Login.aspx?authCAS=Moodle",
@@ -55,7 +91,6 @@ def _build_panopto_session():
     for auth_url in auth_variants:
         try:
             r = s.get(auth_url, timeout=30, allow_redirects=True)
-            # Check if we ended up on Panopto with a valid session
             check = s.get(f"{PANOPTO_BASE}/Panopto/api/v1/auth/legacyLogin", timeout=10)
             if check.status_code != 401:
                 break
@@ -372,13 +407,13 @@ PAGE = """<!DOCTYPE html>
 
 @app.route("/")
 def index():
-    if not all(k in os.environ for k in ("MOODLE_URL", "MOODLE_USERNAME", "MOODLE_PASSWORD", "GROQ_API_KEY")):
+    if not all(k in os.environ for k in ("MOODLE_URL", "MOODLE_USERNAME", "MOODLE_PASSWORD", "MOODLE_ID", "GROQ_API_KEY")):
         body = """
         <h1>Lecture Notes</h1>
         <p class="sub">Set up your environment variables to get started.</p>
         <div class="alert alert-err">
           Missing env vars. Add these in your Railway dashboard:<br><br>
-          <code>MOODLE_URL</code> · <code>MOODLE_USERNAME</code> · <code>MOODLE_PASSWORD</code> · <code>GROQ_API_KEY</code> · <code>SECRET_KEY</code>
+          <code>MOODLE_URL</code> · <code>MOODLE_USERNAME</code> · <code>MOODLE_ID</code> · <code>MOODLE_PASSWORD</code> · <code>GROQ_API_KEY</code> · <code>SECRET_KEY</code>
         </div>"""
         return PAGE.format(body=body)
     return redirect(url_for("lectures"))
