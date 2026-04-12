@@ -419,6 +419,36 @@ def index():
     return redirect(url_for("lectures"))
 
 
+@app.route("/debug")
+def debug():
+    """Diagnostic page — shows auth status and raw Panopto API response."""
+    try:
+        s = get_session()
+        # Check auth status
+        auth_check = s.get(f"{PANOPTO_BASE}/Panopto/api/v1/auth/legacyLogin", timeout=10)
+        auth_status = f"{auth_check.status_code}: {auth_check.text[:300]}"
+
+        # Try sessions with no filters at all
+        r1 = s.get(f"{PANOPTO_BASE}/Panopto/api/v1/sessions",
+                   params={"pagination[maxResults]": 5}, timeout=20)
+        raw_any = f"{r1.status_code}: {r1.text[:500]}"
+
+        # Try sessions with isSharedWithMe
+        r2 = s.get(f"{PANOPTO_BASE}/Panopto/api/v1/sessions",
+                   params={"isSharedWithMe": "true", "pagination[maxResults]": 5}, timeout=20)
+        raw_shared = f"{r2.status_code}: {r2.text[:500]}"
+
+        body = f"""
+        <h1>Debug</h1>
+        <div class="card"><h3>Auth check</h3><pre style="white-space:pre-wrap;font-size:0.75rem;color:#94a3b8">{auth_status}</pre></div>
+        <div class="card"><h3>Sessions (no filter)</h3><pre style="white-space:pre-wrap;font-size:0.75rem;color:#94a3b8">{raw_any}</pre></div>
+        <div class="card"><h3>Sessions (sharedWithMe)</h3><pre style="white-space:pre-wrap;font-size:0.75rem;color:#94a3b8">{raw_shared}</pre></div>
+        <a href="/" class="btn btn-primary">Back</a>"""
+    except Exception as e:
+        body = f'<h1>Debug Error</h1><div class="alert alert-err">{e}</div>'
+    return PAGE.format(body=body)
+
+
 @app.route("/lectures")
 def lectures():
     error = request.args.get("error")
