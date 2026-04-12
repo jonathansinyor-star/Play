@@ -421,31 +421,51 @@ def index():
 
 @app.route("/debug")
 def debug():
-    """Diagnostic page — shows auth status and raw Panopto API response."""
+    """Diagnostic page — shows login form fields and Panopto API responses."""
+    out = {}
     try:
-        s = get_session()
-        # Check auth status
-        auth_check = s.get(f"{PANOPTO_BASE}/Panopto/api/v1/auth/legacyLogin", timeout=10)
-        auth_status = f"{auth_check.status_code}: {auth_check.text[:300]}"
+        moodle_url = os.environ["MOODLE_URL"].rstrip("/")
+        s = req.Session()
+        s.headers["User-Agent"] = "Mozilla/5.0"
 
-        # Try sessions with no filters at all
-        r1 = s.get(f"{PANOPTO_BASE}/Panopto/api/v1/sessions",
-                   params={"pagination[maxResults]": 5}, timeout=20)
-        raw_any = f"{r1.status_code}: {r1.text[:500]}"
+        # Step 1: fetch Moodle login page and follow redirects to SSO
+        r = s.get(f"{moodle_url}/login/index.php", timeout=20, allow_redirects=True)
+        out["login_final_url"] = r.url
+        soup = BeautifulSoup(r.text, "html.parser")
+        form = soup.find("form")
+        if form:
+            out["form_action"] = form.get("action", "")
+            fields = {}
+            for inp in form.find_all("input"):
+                name = inp.get("name", "")
+                itype = inp.get("type", "text")
+                placeholder = inp.get("placeholder", "")
+                if name:
+                    fields[name] = {"type": itype, "placeholder": placeholder}
+            out["form_fields"] = fields
+        else:
+            out["form_fields"] = "NO FORM FOUND"
+            out["page_snippet"] = r.text[:500]
 
-        # Try sessions with isSharedWithMe
-        r2 = s.get(f"{PANOPTO_BASE}/Panopto/api/v1/sessions",
-                   params={"isSharedWithMe": "true", "pagination[maxResults]": 5}, timeout=20)
-        raw_shared = f"{r2.status_code}: {r2.text[:500]}"
+        # Step 2: try Panopto API versions
+        ps = get_session()
+        for ver in ["v1", "4.2", "4.6"]:
+            rv = ps.get(f"{PANOPTO_BASE}/Panopto/api/{ver}/sessions",
+                        params={"pagination[maxResults]": 3}, timeout=15)
+            out[f"api_{ver}"] = f"{rv.status_code}: {rv.text[:200]}"
 
+        # Step 3: try the older Panopto REST path
+        rv2 = ps.get(f"{PANOPTO_BASE}/Panopto/Services/Data.svc/GetSessionsList",
+                     timeout=15)
+        out["old_api"] = f"{rv2.status_code}: {rv2.text[:200]}"
+
+        lines = "\n".join(f"{k}: {v}" for k, v in out.items())
         body = f"""
         <h1>Debug</h1>
-        <div class="card"><h3>Auth check</h3><pre style="white-space:pre-wrap;font-size:0.75rem;color:#94a3b8">{auth_status}</pre></div>
-        <div class="card"><h3>Sessions (no filter)</h3><pre style="white-space:pre-wrap;font-size:0.75rem;color:#94a3b8">{raw_any}</pre></div>
-        <div class="card"><h3>Sessions (sharedWithMe)</h3><pre style="white-space:pre-wrap;font-size:0.75rem;color:#94a3b8">{raw_shared}</pre></div>
+        <div class="card"><pre style="white-space:pre-wrap;font-size:0.72rem;color:#94a3b8">{lines}</pre></div>
         <a href="/" class="btn btn-primary">Back</a>"""
     except Exception as e:
-        body = f'<h1>Debug Error</h1><div class="alert alert-err">{e}</div>'
+        body = f'<h1>Debug Error</h1><div class="alert alert-err">{e}</div><pre>{out}</pre>'
     return PAGE.format(body=body)
 
 
