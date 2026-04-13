@@ -44,15 +44,74 @@ def _try_sso_login():
     s = req.Session()
     s.headers["User-Agent"] = UA
 
-    # 1. Kick off SSO — Panopto redirects → Moodle → NetIQ login form
-    try:
-        r = s.get(f"{PANOPTO_BASE}/Panopto/Pages/Auth/Login.aspx",
-                  params={"authCAS": "MOODLE"}, allow_redirects=True, timeout=20)
-    except Exception as e:
-        _sso_last_error = f"SSO start error: {e}"
+    # 1. Kick off SSO — try Moodle2025 first (TAU's provider name), then MOODLE
+    r = None
+    for cas_name in ["Moodle2025", "MOODLE", "Moodle"]:
+        try:
+            r = s.get(f"{PANOPTO_BASE}/Panopto/Pages/Auth/Login.aspx",
+                      params={"authCAS": cas_name}, allow_redirects=True, timeout=20)
+            # If we got redirected away from Panopto, we've found the right provider
+            if "panopto" not in r.url.lower() or "nidp" in r.url.lower() or "moodle" in r.url.lower():
+                _sso_last_error = f"SSO redirected to: {r.url[:80]} using authCAS={cas_name}"
+                break
+        except Exception as e:
+            _sso_last_error = f"SSO start error ({cas_name}): {e}"
+            continue
+
+    if r is None:
         return None
 
     _sso_last_error = f"landed at: {r.url[:80]}"
+
+    # If still on Panopto's login page, try clicking the Moodle button via form submit
+    if "panopto" in r.url.lower() and "nidp" not in r.url.lower():
+        soup0 = BeautifulSoup(r.text, "html.parser")
+        form0 = soup0.find("form")
+        # Look for Moodle link in page
+        moodle_href = None
+        for a in soup0.find_all("a", href=True):
+            if "moodle" in a["href"].lower() or "cas" in a["href"].lower():
+                moodle_href = a["href"]
+                break
+        # Look in script tags for redirect URL
+        if not moodle_href:
+            for script in soup0.find_all("script"):
+                src = script.string or ""
+                m = re.search(r"['\"]([^'\"]*(?:moodle|nidp|cas)[^'\"]*)['\"]", src, re.IGNORECASE)
+                if m and m.group(1).startswith("/"):
+                    moodle_href = m.group(1)
+                    break
+        if moodle_href:
+            if not moodle_href.startswith("http"):
+                from urllib.parse import urljoin
+                moodle_href = urljoin(r.url, moodle_href)
+            try:
+                r = s.get(moodle_href, allow_redirects=True, timeout=20)
+                _sso_last_error += f" | followed link to: {r.url[:80]}"
+            except Exception as e:
+                _sso_last_error += f" | link follow error: {e}"
+        elif form0:
+            # Try submitting the ViewState form with Moodle event target guesses
+            action0 = form0.get("action", r.url)
+            if not action0.startswith("http"):
+                from urllib.parse import urljoin
+                action0 = urljoin(r.url, action0)
+            data0 = {inp["name"]: inp.get("value", "")
+                     for inp in form0.find_all("input") if inp.get("name")}
+            # Try known ASP.NET event target names for Moodle provider
+            for evt in ["ctl00$PageContentPlaceholder$loginControl$signInWithMoodle",
+                        "ctl00$PageContentPlaceholder$loginControl$moodleBtn",
+                        "ctl00$PageContentPlaceholder$loginControl$externalLogin"]:
+                data0["__EVENTTARGET"] = evt
+                data0["ctl00$PageContentPlaceholder$loginControl$forceStateChanged"] = "true"
+                try:
+                    r2 = s.post(action0, data=data0, allow_redirects=True, timeout=20)
+                    if "nidp" in r2.url or "moodle" in r2.url.lower():
+                        r = r2
+                        _sso_last_error += f" | form submit→{r.url[:60]}"
+                        break
+                except Exception:
+                    pass
 
     # 2. Find and fill the login form
     soup = BeautifulSoup(r.text, "html.parser")
@@ -606,7 +665,15 @@ def debug():
         out["sso_status"] = _sso_last_error
         out["cookies"] = list(s.cookies.keys())
         out["has_aspxauth"] = ".ASPXAUTH" in [c.name for c in s.cookies]
-        out["csrf_decoded_len"] = len(csrf)
+
+        # Show Login.aspx HTML so we can see what's on the page
+        try:
+            rl = s.get(f"{PANOPTO_BASE}/Panopto/Pages/Auth/Login.aspx",
+                       params={"authCAS": "Moodle2025"}, allow_redirects=True, timeout=10)
+            out["login_page_url"] = rl.url[:100]
+            out["login_page_html"] = rl.text[:800]
+        except Exception as ex:
+            out["login_page_html"] = f"ERR: {ex}"
 
         # Test WebMethod with decoded CSRF token
         try:
