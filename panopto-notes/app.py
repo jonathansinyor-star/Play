@@ -29,7 +29,7 @@ UA = ("Mozilla/5.0 (iPad; CPU OS 17_0 like Mac OS X) "
 
 
 def _try_sso_login():
-    """Attempt Panopto → Moodle → NetIQ SSO. Returns requests.Session or None."""
+    """Log in via Moodle → NetIQ → Panopto. Returns requests.Session or None."""
     from bs4 import BeautifulSoup
     from urllib.parse import urljoin
 
@@ -37,163 +37,134 @@ def _try_sso_login():
     username = os.environ.get("MOODLE_USERNAME", "")
     moodle_id = os.environ.get("MOODLE_ID", "")
     password = os.environ.get("MOODLE_PASSWORD", "")
+    moodle_base = os.environ.get("MOODLE_URL", "https://moodle.tau.ac.il").rstrip("/")
+
     if not username or not password:
-        _sso_last_error = "MOODLE_USERNAME or MOODLE_PASSWORD not set"
+        _sso_last_error = "Missing MOODLE_USERNAME or MOODLE_PASSWORD"
         return None
 
     s = req.Session()
     s.headers["User-Agent"] = UA
 
-    # 1. Kick off SSO — try Moodle2025 first (TAU's provider name), then MOODLE
-    r = None
-    for cas_name in ["Moodle2025", "MOODLE", "Moodle"]:
-        try:
-            r = s.get(f"{PANOPTO_BASE}/Panopto/Pages/Auth/Login.aspx",
-                      params={"authCAS": cas_name}, allow_redirects=True, timeout=20)
-            # If we got redirected away from Panopto, we've found the right provider
-            if "panopto" not in r.url.lower() or "nidp" in r.url.lower() or "moodle" in r.url.lower():
-                _sso_last_error = f"SSO redirected to: {r.url[:80]} using authCAS={cas_name}"
-                break
-        except Exception as e:
-            _sso_last_error = f"SSO start error ({cas_name}): {e}"
-            continue
-
-    if r is None:
-        return None
-
-    _sso_last_error = f"landed at: {r.url[:80]}"
-
-    # If still on Panopto's login page, try clicking the Moodle button via form submit
-    if "panopto" in r.url.lower() and "nidp" not in r.url.lower():
-        soup0 = BeautifulSoup(r.text, "html.parser")
-        form0 = soup0.find("form")
-        # Look for Moodle link in page
-        moodle_href = None
-        for a in soup0.find_all("a", href=True):
-            if "moodle" in a["href"].lower() or "cas" in a["href"].lower():
-                moodle_href = a["href"]
-                break
-        # Look in script tags for redirect URL
-        if not moodle_href:
-            for script in soup0.find_all("script"):
-                src = script.string or ""
-                m = re.search(r"['\"]([^'\"]*(?:moodle|nidp|cas)[^'\"]*)['\"]", src, re.IGNORECASE)
-                if m and m.group(1).startswith("/"):
-                    moodle_href = m.group(1)
-                    break
-        if moodle_href:
-            if not moodle_href.startswith("http"):
-                from urllib.parse import urljoin
-                moodle_href = urljoin(r.url, moodle_href)
-            try:
-                r = s.get(moodle_href, allow_redirects=True, timeout=20)
-                _sso_last_error += f" | followed link to: {r.url[:80]}"
-            except Exception as e:
-                _sso_last_error += f" | link follow error: {e}"
-        elif form0:
-            # Try submitting the ViewState form with Moodle event target guesses
-            action0 = form0.get("action", r.url)
-            if not action0.startswith("http"):
-                from urllib.parse import urljoin
-                action0 = urljoin(r.url, action0)
-            data0 = {inp["name"]: inp.get("value", "")
-                     for inp in form0.find_all("input") if inp.get("name")}
-            # Try known ASP.NET event target names for Moodle provider
-            for evt in ["ctl00$PageContentPlaceholder$loginControl$signInWithMoodle",
-                        "ctl00$PageContentPlaceholder$loginControl$moodleBtn",
-                        "ctl00$PageContentPlaceholder$loginControl$externalLogin"]:
-                data0["__EVENTTARGET"] = evt
-                data0["ctl00$PageContentPlaceholder$loginControl$forceStateChanged"] = "true"
-                try:
-                    r2 = s.post(action0, data=data0, allow_redirects=True, timeout=20)
-                    if "nidp" in r2.url or "moodle" in r2.url.lower():
-                        r = r2
-                        _sso_last_error += f" | form submit→{r.url[:60]}"
-                        break
-                except Exception:
-                    pass
-
-    # 2. Find and fill the login form
-    soup = BeautifulSoup(r.text, "html.parser")
-    form = soup.find("form")
-    if not form:
-        _sso_last_error = f"No form at {r.url[:80]}. Snippet: {r.text[:150]}"
-        return None
-
-    action = form.get("action", r.url)
-    if not action.startswith("http"):
-        action = urljoin(r.url, action)
-
-    data = {inp["name"]: inp.get("value", "")
-            for inp in form.find_all("input") if inp.get("name")}
-
-    text_fields = [inp["name"] for inp in form.find_all("input")
-                   if inp.get("name") and inp.get("type", "text").lower() in ("text", "email", "")]
-    pass_fields = [inp["name"] for inp in form.find_all("input")
+    def _fill_and_post(r):
+        """Fill credentials into first form found, post it, return new response."""
+        soup = BeautifulSoup(r.text, "html.parser")
+        form = soup.find("form")
+        if not form:
+            return None
+        action = form.get("action", r.url)
+        if not action.startswith("http"):
+            action = urljoin(r.url, action)
+        data = {inp["name"]: inp.get("value", "")
+                for inp in form.find_all("input") if inp.get("name")}
+        text_f = [inp["name"] for inp in form.find_all("input")
+                  if inp.get("name") and inp.get("type", "text").lower() in ("text", "email", "")]
+        pass_f  = [inp["name"] for inp in form.find_all("input")
                    if inp.get("name") and inp.get("type", "").lower() == "password"]
+        for k in ["Ecom_User_ID", "username", "loginname", "j_username"]:
+            if k in data:
+                data[k] = username
+                break
+        else:
+            if text_f:
+                data[text_f[0]] = username
+        if moodle_id and len(text_f) >= 2:
+            data[text_f[1]] = moodle_id
+        for k in ["Ecom_Password", "password", "passwd", "j_password"]:
+            if k in data:
+                data[k] = password
+                break
+        else:
+            if pass_f:
+                data[pass_f[0]] = password
+        try:
+            return s.post(action, data=data, allow_redirects=True, timeout=30)
+        except Exception:
+            return None
 
-    # Fill username (first text field or known names)
-    filled = False
-    for fname in ["Ecom_User_ID", "username", "loginname", "j_username", "user"]:
-        if fname in data:
-            data[fname] = username
-            filled = True
-            break
-    if not filled and text_fields:
-        data[text_fields[0]] = username
+    def _follow_relays(r, max_steps=5):
+        """Follow SAML/CAS auto-submit relay forms."""
+        for _ in range(max_steps):
+            if any(c.name == ".ASPXAUTH" for c in s.cookies):
+                break
+            soup = BeautifulSoup(r.text, "html.parser")
+            form = soup.find("form")
+            if not form:
+                break
+            ra = form.get("action", "")
+            if not ra:
+                break
+            if not ra.startswith("http"):
+                ra = urljoin(r.url, ra)
+            rd = {inp["name"]: inp.get("value", "")
+                  for inp in form.find_all("input") if inp.get("name")}
+            relay_keys = ("SAMLResponse", "RelayState", "lt", "ticket", "execution", "SAMLRequest")
+            has_pass = bool(form.find("input", {"type": "password"}))
+            if has_pass:
+                r2 = _fill_and_post(r)
+                if not r2:
+                    break
+                r = r2
+                _sso_last_error += f" | creds→{r.url[:50]}"
+            elif any(k in rd for k in relay_keys):
+                try:
+                    r = s.post(ra, data=rd, allow_redirects=True, timeout=20)
+                    _sso_last_error += f" | relay→{r.url[:50]}"
+                except Exception:
+                    break
+            else:
+                break
+        return r
 
-    # Fill student ID into second text field if present
-    if moodle_id and len(text_fields) >= 2:
-        data[text_fields[1]] = moodle_id
-
-    # Fill password
-    filled = False
-    for fname in ["Ecom_Password", "password", "passwd", "j_password"]:
-        if fname in data:
-            data[fname] = password
-            filled = True
-            break
-    if not filled and pass_fields:
-        data[pass_fields[0]] = password
-
-    _sso_last_error += f" | form→{action[:60]} fields={list(data.keys())}"
-
+    # ── 1. Start at Moodle login (redirects to NetIQ plain-HTML form) ──
     try:
-        r2 = s.post(action, data=data, allow_redirects=True, timeout=30)
+        r = s.get(f"{moodle_base}/login/index.php", allow_redirects=True, timeout=20)
+        _sso_last_error = f"1.moodle→{r.url[:70]}"
     except Exception as e:
-        _sso_last_error += f" | submit error: {e}"
+        _sso_last_error = f"Moodle unreachable: {e}"
         return None
 
-    _sso_last_error += f" | after submit: {r2.url[:60]}"
+    # ── 2. Fill credentials (NetIQ or Moodle login form) ──
+    r2 = _fill_and_post(r)
+    if not r2:
+        _sso_last_error += " | no form found"
+        return None
+    _sso_last_error += f" | 2.creds→{r2.url[:60]}"
 
-    # 3. Follow any SAML/CAS relay forms (hidden auto-submit)
-    for _ in range(4):
-        if any(c.name == ".ASPXAUTH" for c in s.cookies):
-            break
-        soup2 = BeautifulSoup(r2.text, "html.parser")
-        relay = soup2.find("form")
-        if not relay:
-            break
-        ra = relay.get("action", "")
-        if not ra:
-            break
-        if not ra.startswith("http"):
-            ra = urljoin(r2.url, ra)
-        rd = {inp["name"]: inp.get("value", "")
-              for inp in relay.find_all("input") if inp.get("name")}
-        if not any(k in rd for k in ("SAMLResponse", "lt", "ticket", "RelayState", "execution")):
-            break
+    # ── 3. Follow SAML relay chain ──
+    r2 = _follow_relays(r2)
+
+    # ── 4. Trigger Panopto auth from now-logged-in Moodle session ──
+    if not any(c.name == ".ASPXAUTH" for c in s.cookies):
+        _sso_last_error += " | 3.panopto"
         try:
-            r2 = s.post(ra, data=rd, allow_redirects=True, timeout=20)
-            _sso_last_error += f" | relay→{r2.url[:60]}"
-        except Exception:
-            break
+            r3 = s.get(f"{PANOPTO_BASE}/Panopto/Pages/Auth/Login.aspx",
+                       params={"authCAS": "Moodle2025"}, allow_redirects=True, timeout=20)
+            _sso_last_error += f"→{r3.url[:60]}"
+            # If Panopto returned its own login page, submit forceStateChanged
+            if "panopto" in r3.url.lower():
+                soup3 = BeautifulSoup(r3.text, "html.parser")
+                form3 = soup3.find("form")
+                if form3:
+                    action3 = form3.get("action", r3.url)
+                    if not action3.startswith("http"):
+                        action3 = urljoin(r3.url, action3)
+                    data3 = {inp["name"]: inp.get("value", "")
+                             for inp in form3.find_all("input") if inp.get("name")}
+                    data3["ctl00$PageContentPlaceholder$loginControl$forceStateChanged"] = "Moodle2025"
+                    r4 = s.post(action3, data=data3, allow_redirects=True, timeout=20)
+                    _sso_last_error += f" | force→{r4.url[:50]}"
+                    _follow_relays(r4)
+        except Exception as e:
+            _sso_last_error += f" err:{e}"
 
     if any(c.name == ".ASPXAUTH" for c in s.cookies):
         _sso_last_error = "SSO SUCCESS"
         return s
 
-    _sso_last_error += f" | FAILED — cookies: {[c.name for c in s.cookies]}"
+    moodle_cookies = [c.name for c in s.cookies
+                      if any(d in c.domain for d in ("tau.ac.il", "panopto"))]
+    _sso_last_error += f" | FAILED. cookies={moodle_cookies}"
     return None
 
 
