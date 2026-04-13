@@ -83,11 +83,17 @@ def _webmethod_sessions(s, max_results=100):
             "sessionListScope": 2,  # 2 = Shared with me
         }
     }
+    list_url = f"{PANOPTO_BASE}/Panopto/Pages/Sessions/List.aspx"
     r = s.post(
-        f"{PANOPTO_BASE}/Panopto/Pages/Sessions/List.aspx/GetSessions",
+        f"{list_url}/GetSessions",
         json=payload,
-        headers={"X-CSRF-Token": csrf, "Accept": "application/json",
-                 "Content-Type": "application/json; charset=UTF-8"},
+        headers={
+            "X-CSRF-Token": csrf,
+            "Accept": "application/json",
+            "Content-Type": "application/json; charset=UTF-8",
+            "Referer": list_url,
+            "Origin": PANOPTO_BASE,
+        },
         timeout=30,
     )
     r.raise_for_status()
@@ -441,26 +447,38 @@ def index():
 
 @app.route("/debug")
 def debug():
-    """Fast auth check — only tests WebMethod endpoint."""
+    """Fast auth check — tests WebMethod with Referer header."""
     out = {}
     try:
         s = get_session()
         csrf = s.cookies.get("csrfToken", "")
-        hdrs = {"X-CSRF-Token": csrf, "Accept": "application/json",
-                "Content-Type": "application/json; charset=UTF-8"}
+        list_url = f"{PANOPTO_BASE}/Panopto/Pages/Sessions/List.aspx"
+        hdrs = {
+            "X-CSRF-Token": csrf,
+            "Accept": "application/json",
+            "Content-Type": "application/json; charset=UTF-8",
+            "Referer": list_url,
+            "Origin": PANOPTO_BASE,
+        }
         out["cookies"] = list(s.cookies.keys())
         out["has_aspxauth"] = ".ASPXAUTH" in [c.name for c in s.cookies]
 
-        for scope in [0, 1, 2, 3]:
-            try:
-                payload = {"queryParameters": {"query": "", "sortColumn": 1, "sortAscending": False,
-                           "maxResults": 5, "page": 0, "startDate": None, "endDate": None,
-                           "folderID": None, "bookmarked": False, "sessionListScope": scope}}
-                rv = s.post(f"{PANOPTO_BASE}/Panopto/Pages/Sessions/List.aspx/GetSessions",
-                            json=payload, headers=hdrs, timeout=15)
-                out[f"scope={scope}"] = f"HTTP {rv.status_code} | {rv.text[:400]}"
-            except Exception as ex:
-                out[f"scope={scope}"] = f"ERR: {ex}"
+        # Test scope=2 (Shared With Me) with Referer
+        try:
+            payload = {"queryParameters": {"query": "", "sortColumn": 1, "sortAscending": False,
+                       "maxResults": 5, "page": 0, "startDate": None, "endDate": None,
+                       "folderID": None, "bookmarked": False, "sessionListScope": 2}}
+            rv = s.post(f"{list_url}/GetSessions", json=payload, headers=hdrs, timeout=10)
+            out["webmethod_scope2"] = f"HTTP {rv.status_code} | {rv.text[:500]}"
+        except Exception as ex:
+            out["webmethod_scope2"] = f"ERR: {ex}"
+
+        # Also fetch the HTML page to verify cookies work
+        try:
+            rv2 = s.get(list_url, timeout=10)
+            out["list_page"] = f"HTTP {rv2.status_code} | logged_in={'MyContent' in rv2.text or 'panopto' in rv2.text.lower()}"
+        except Exception as ex:
+            out["list_page"] = f"ERR: {ex}"
 
         lines = "\n\n".join(f"{k}:\n  {v}" for k, v in out.items())
         body = f"""
