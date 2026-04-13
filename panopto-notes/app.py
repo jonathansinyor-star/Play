@@ -175,34 +175,54 @@ def _try_sso_login():
                     if r2:
                         _follow_relays(r2)
                 else:
-                    # ViewState / login-chooser form
+                    # ViewState / login-chooser form.
+                    # ASP.NET WebForms button clicks use __EVENTTARGET/__EVENTARGUMENT,
+                    # NOT custom hidden fields. The browser calls __doPostBack(id, arg).
+                    # Find those calls in the page HTML to get the real control IDs.
                     action = form.get("action") or r.url
                     if not action.startswith("http"):
                         action = urljoin(r.url, action)
-                    data = {i["name"]: i.get("value", "")
-                            for i in form.find_all("input") if i.get("name")}
-                    # Set forceStateChanged — JS adds this field dynamically in the browser;
-                    # we must inject it explicitly with the known ASP.NET control ID.
-                    data["ctl00$PageContentPlaceholder$loginControl$forceStateChanged"] = auth_cas
-                    for k in list(data.keys()):
-                        if "forceState" in k:
-                            data[k] = auth_cas
+                    base_data = {i["name"]: i.get("value", "")
+                                 for i in form.find_all("input") if i.get("name")}
 
-                    # POST with allow_redirects=False first to see WHERE Panopto sends us
-                    r_post = s.post(action, data=data, allow_redirects=False, timeout=20)
-                    loc = r_post.headers.get("Location", "")
-                    _sso_last_error_parts.append(f"POST→{r_post.status_code} loc={loc[:80]}")
+                    # Extract __doPostBack targets from the page
+                    dopost = re.findall(r"__doPostBack\('([^']+)','([^']*)'\)", r.text)
 
-                    if r_post.status_code in (301, 302, 303, 307, 308) and loc:
-                        # Follow from the redirect target
-                        if not loc.startswith("http"):
-                            loc = urljoin(PANOPTO_BASE, loc)
-                        r2 = s.get(loc, allow_redirects=True, timeout=20)
-                        _sso_last_error_parts.append(f"→{r2.url[:60]}")
-                        _follow_relays(r2)
-                    elif r_post.status_code == 200:
-                        # Stayed on same page — try following relays on the response
-                        _follow_relays(r_post)
+                    def _try_post(extra_fields):
+                        d = dict(base_data)
+                        d.update(extra_fields)
+                        rp = s.post(action, data=d, allow_redirects=False, timeout=20)
+                        loc = rp.headers.get("Location", "")
+                        _sso_last_error_parts.append(
+                            f"POST→{rp.status_code} loc={loc[:60]}")
+                        if rp.status_code in (301, 302, 303, 307, 308) and loc:
+                            if not loc.startswith("http"):
+                                loc = urljoin(PANOPTO_BASE, loc)
+                            r2 = s.get(loc, allow_redirects=True, timeout=20)
+                            _sso_last_error_parts.append(f"→{r2.url[:60]}")
+                            _follow_relays(r2)
+                            return True
+                        return False
+
+                    # Try each doPostBack target found on the page
+                    for target, arg in dopost:
+                        if _try_post({"__EVENTTARGET": target, "__EVENTARGUMENT": arg}):
+                            if any(c.name == ".ASPXAUTH" for c in s.cookies):
+                                break
+
+                    # If no doPostBack found or none worked, try known field name patterns
+                    if not any(c.name == ".ASPXAUTH" for c in s.cookies):
+                        for extra in [
+                            {"__EVENTTARGET": "ctl00$PageContentPlaceholder$loginControl$lbtnLogin",
+                             "__EVENTARGUMENT": auth_cas},
+                            {"forceStateChanged": auth_cas,
+                             "ctl00$PageContentPlaceholder$loginControl$forceStateChanged": auth_cas},
+                            {"__EVENTTARGET": "ctl00$PageContentPlaceholder$loginControl$loginButton",
+                             "__EVENTARGUMENT": ""},
+                        ]:
+                            if _try_post(extra):
+                                if any(c.name == ".ASPXAUTH" for c in s.cookies):
+                                    break
         except Exception as e:
             _sso_last_error_parts.append(f"err:{e}")
         return any(c.name == ".ASPXAUTH" for c in s.cookies)
@@ -778,32 +798,44 @@ def debug():
             # Step 1: GET Login.aspx
             r1 = sf.get(f"{PANOPTO_BASE}/Panopto/Pages/Auth/Login.aspx",
                         params={"authCAS": "Moodle2025"}, allow_redirects=True, timeout=12)
+            from urllib.parse import urljoin as _urljoin
             out["pan_step1_url"] = r1.url[:120]
-            out["pan_step1_html_snippet"] = r1.text[:400]
-            # Step 2: POST ViewState form with forceStateChanged
             soup1 = _BS(r1.text, "html.parser")
             form1 = soup1.find("form")
             if form1:
                 action1 = form1.get("action") or r1.url
                 if not action1.startswith("http"):
-                    from urllib.parse import urljoin as _urljoin
                     action1 = _urljoin(r1.url, action1)
+                inp_names = {i.get("name"): i.get("value","")[:30]
+                             for i in form1.find_all("input") if i.get("name")}
+                out["pan_form_inputs"] = str(inp_names)
+                # Find __doPostBack calls — these are the real button control IDs
+                dopost = re.findall(r"__doPostBack\('([^']+)','([^']*)'\)", r1.text)
+                out["pan_dopostback"] = str(dopost[:10])
+                # Find any auth/moodle URLs referenced in the page JS/HTML
+                auth_refs = re.findall(
+                    r'["\'](https?://[^"\'<>\s]*(?:moodle|saml|nidp|auth|cas)[^"\'<>\s]*)["\']',
+                    r1.text, re.I)
+                out["pan_auth_refs"] = str(auth_refs[:6])
+                # Step 2: POST with first doPostBack target (allow_redirects=False)
                 data1 = {i["name"]: i.get("value", "")
                          for i in form1.find_all("input") if i.get("name")}
-                data1["ctl00$PageContentPlaceholder$loginControl$forceStateChanged"] = "Moodle2025"
+                if dopost:
+                    data1["__EVENTTARGET"] = dopost[0][0]
+                    data1["__EVENTARGUMENT"] = dopost[0][1]
+                else:
+                    data1["ctl00$PageContentPlaceholder$loginControl$forceStateChanged"] = "Moodle2025"
                 r2 = sf.post(action1, data=data1, allow_redirects=False, timeout=12)
                 out["pan_step2_status"] = r2.status_code
                 out["pan_step2_location"] = r2.headers.get("Location", "(no Location header)")
-                out["pan_step2_body_snippet"] = r2.text[:200]
-                # Step 3: follow the redirect if there was one
+                # Step 3: follow redirect if any
                 loc2 = r2.headers.get("Location", "")
                 if loc2:
                     if not loc2.startswith("http"):
-                        from urllib.parse import urljoin as _urljoin2
-                        loc2 = _urljoin2(PANOPTO_BASE, loc2)
+                        loc2 = _urljoin(PANOPTO_BASE, loc2)
                     r3 = sf.get(loc2, allow_redirects=True, timeout=12)
                     out["pan_step3_url"] = r3.url[:120]
-                    out["pan_step3_html_snippet"] = r3.text[:500]
+                    out["pan_step3_html_snippet"] = r3.text[:400]
             else:
                 out["pan_step1_form"] = "NO FORM FOUND"
                 out["pan_step1_js_url"] = str(_extract_js_url_debug(r1.text, r1.url))
