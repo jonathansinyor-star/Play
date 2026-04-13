@@ -178,22 +178,44 @@ def _try_sso_login():
                     return True
                 _follow_relays(r2)
             elif r.status_code == 200:
-                # JS redirect in body — check with _follow_relays and direct URL search
-                _follow_relays(r)
-                if not any(c.name == ".ASPXAUTH" for c in s.cookies):
-                    # Search body for moodle/auth URLs and navigate to them
-                    body_urls = re.findall(
-                        r'https?://[^\s"\'<>]*(?:moodle|saml|nidp|sso)[^\s"\'<>]*',
-                        r.text, re.I)
-                    for burl in body_urls[:3]:
-                        try:
-                            r_b = s.get(burl, allow_redirects=True, timeout=20)
-                            _sso_last_error_parts.append(f"body→{r_b.url[:60]}")
-                            _follow_relays(r_b)
-                            if any(c.name == ".ASPXAUTH" for c in s.cookies):
-                                return True
-                        except Exception:
-                            pass
+                # The JS builds: Login.aspx?panoptoState=<value>
+                # Try to find panoptoState variable assignment in the page JS
+                body = r.text
+                ps_match = re.search(
+                    r"panoptoState\s*[=:]\s*['\"]([^'\"]{4,})['\"]", body)
+                if ps_match:
+                    ps_val = ps_match.group(1)
+                    ps_url = (f"{PANOPTO_BASE}/Panopto/Pages/Auth/Login.aspx"
+                              f"?panoptoState={ps_val}")
+                    _sso_last_error_parts.append(f"panoptoState→{ps_url[:80]}")
+                    rps = s.get(ps_url, allow_redirects=True, timeout=20)
+                    _sso_last_error_parts.append(f"→{rps.url[:70]}")
+                    _follow_relays(rps)
+                else:
+                    # Try common base64 encoding patterns for panoptoState
+                    import base64
+                    for ret_url in ("/Panopto/Pages/Sessions/List.aspx", "/"):
+                        for state_obj in [
+                            f'{{"provider":"{auth_cas}","returnUrl":"{ret_url}"}}',
+                            f'{{"Provider":"{auth_cas}","ReturnUrl":"{ret_url}"}}',
+                        ]:
+                            try:
+                                ps_val = base64.b64encode(state_obj.encode()).decode()
+                                ps_url = (f"{PANOPTO_BASE}/Panopto/Pages/Auth/Login.aspx"
+                                          f"?panoptoState={ps_val}")
+                                rps = s.get(ps_url, allow_redirects=False, timeout=15)
+                                ps_loc = rps.headers.get("Location", "")
+                                _sso_last_error_parts.append(
+                                    f"b64state→{rps.status_code} loc={ps_loc[:60]}")
+                                if rps.status_code in (301, 302, 303) and ps_loc:
+                                    if not ps_loc.startswith("http"):
+                                        ps_loc = urljoin(PANOPTO_BASE, ps_loc)
+                                    rps2 = s.get(ps_loc, allow_redirects=True, timeout=20)
+                                    _follow_relays(rps2)
+                                    if any(c.name == ".ASPXAUTH" for c in s.cookies):
+                                        return True
+                            except Exception:
+                                pass
         except Exception as e:
             _sso_last_error_parts.append(f"err:{e}")
         return any(c.name == ".ASPXAUTH" for c in s.cookies)
@@ -820,12 +842,20 @@ def debug():
                     r'https?://[^\s"\'\\<>]*(?:moodle|saml|nidp|sso|auth)[^\s"\'\\<>]*',
                     r_inst.text, re.I)
                 out["pan_instance_auth_urls"] = str(inst_urls[:6])
-                # Check for any JS redirect patterns in the body
+                # Show context around 'panoptoState' — reveals how the redirect is built
+                idx_ps = r_inst.text.find('panoptoState')
+                if idx_ps >= 0:
+                    out["pan_state_ctx"] = r_inst.text[max(0, idx_ps - 100):idx_ps + 500]
+                else:
+                    out["pan_state_ctx"] = "panoptoState NOT IN BODY"
+                # Show context around 'instance' in the body JS
+                idx_inst = r_inst.text.find("'instance'")
+                if idx_inst < 0:
+                    idx_inst = r_inst.text.find('"instance"')
+                if idx_inst >= 0:
+                    out["pan_instance_var_ctx"] = r_inst.text[max(0, idx_inst - 50):idx_inst + 300]
+                # Try to also follow the JS redirect if there's a location.href
                 out["pan_instance_js_redir"] = str(_extract_js_url_debug(r_inst.text, r_inst.url))
-                # Show any JSON blobs mentioning providers
-                inst_json = [m[:200] for m in re.findall(r'\{[^{}]{20,300}\}', r_inst.text)
-                             if any(k in m.lower() for k in ('moodle','provider','redirect','saml','url'))]
-                out["pan_instance_json"] = str(inst_json[:3])
             else:
                 out["pan_step1_form"] = "NO FORM FOUND"
                 out["pan_step1_js_url"] = str(_extract_js_url_debug(r1.text, r1.url))
