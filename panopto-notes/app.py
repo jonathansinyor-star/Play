@@ -5,6 +5,7 @@ import subprocess
 import tempfile
 import math
 from datetime import datetime
+from urllib.parse import unquote
 from flask import Flask, request, session, Response, send_file, redirect, url_for
 import requests as req
 from groq import Groq
@@ -68,7 +69,7 @@ def _parse_ms_date(date_str):
 
 def _webmethod_sessions(s, max_results=100):
     """Call Panopto's internal GetSessions WebMethod (what the web app uses)."""
-    csrf = s.cookies.get("csrfToken", "")
+    csrf = unquote(s.cookies.get("csrfToken", ""))
     payload = {
         "queryParameters": {
             "query": "",
@@ -451,7 +452,7 @@ def debug():
     out = {}
     try:
         s = get_session()
-        csrf = s.cookies.get("csrfToken", "")
+        csrf = unquote(s.cookies.get("csrfToken", ""))  # decode %2f → /
         list_url = f"{PANOPTO_BASE}/Panopto/Pages/Sessions/List.aspx"
         hdrs = {
             "X-CSRF-Token": csrf,
@@ -462,23 +463,17 @@ def debug():
         }
         out["cookies"] = list(s.cookies.keys())
         out["has_aspxauth"] = ".ASPXAUTH" in [c.name for c in s.cookies]
+        out["csrf_decoded_len"] = len(csrf)
 
-        # Test scope=2 (Shared With Me) with Referer
+        # Test WebMethod with decoded CSRF token
         try:
             payload = {"queryParameters": {"query": "", "sortColumn": 1, "sortAscending": False,
                        "maxResults": 5, "page": 0, "startDate": None, "endDate": None,
                        "folderID": None, "bookmarked": False, "sessionListScope": 2}}
             rv = s.post(f"{list_url}/GetSessions", json=payload, headers=hdrs, timeout=10)
-            out["webmethod_scope2"] = f"HTTP {rv.status_code} | {rv.text[:500]}"
+            out["webmethod"] = f"HTTP {rv.status_code} | {rv.text[:500]}"
         except Exception as ex:
-            out["webmethod_scope2"] = f"ERR: {ex}"
-
-        # Also fetch the HTML page to verify cookies work
-        try:
-            rv2 = s.get(list_url, timeout=10)
-            out["list_page"] = f"HTTP {rv2.status_code} | logged_in={'MyContent' in rv2.text or 'panopto' in rv2.text.lower()}"
-        except Exception as ex:
-            out["list_page"] = f"ERR: {ex}"
+            out["webmethod"] = f"ERR: {ex}"
 
         lines = "\n\n".join(f"{k}:\n  {v}" for k, v in out.items())
         body = f"""
