@@ -806,36 +806,31 @@ def debug():
                 action1 = form1.get("action") or r1.url
                 if not action1.startswith("http"):
                     action1 = _urljoin(r1.url, action1)
-                inp_names = {i.get("name"): i.get("value","")[:30]
-                             for i in form1.find_all("input") if i.get("name")}
-                out["pan_form_inputs"] = str(inp_names)
-                # Find __doPostBack calls — these are the real button control IDs
-                dopost = re.findall(r"__doPostBack\('([^']+)','([^']*)'\)", r1.text)
-                out["pan_dopostback"] = str(dopost[:10])
-                # Find any auth/moodle URLs referenced in the page JS/HTML
-                auth_refs = re.findall(
-                    r'["\'](https?://[^"\'<>\s]*(?:moodle|saml|nidp|auth|cas)[^"\'<>\s]*)["\']',
-                    r1.text, re.I)
-                out["pan_auth_refs"] = str(auth_refs[:6])
-                # Step 2: POST with first doPostBack target (allow_redirects=False)
-                data1 = {i["name"]: i.get("value", "")
-                         for i in form1.find_all("input") if i.get("name")}
-                if dopost:
-                    data1["__EVENTTARGET"] = dopost[0][0]
-                    data1["__EVENTARGUMENT"] = dopost[0][1]
+                out["pan_form_field_names"] = str(list(inp_names.keys()))
+
+                # THE KEY: find 'Moodle2025' in the page and show surrounding context
+                # This reveals exactly how the JS triggers the redirect
+                idx = r1.text.find('Moodle2025')
+                if idx >= 0:
+                    out["moodle2025_ctx"] = r1.text[max(0, idx - 200):idx + 300]
                 else:
-                    data1["ctl00$PageContentPlaceholder$loginControl$forceStateChanged"] = "Moodle2025"
-                r2 = sf.post(action1, data=data1, allow_redirects=False, timeout=12)
-                out["pan_step2_status"] = r2.status_code
-                out["pan_step2_location"] = r2.headers.get("Location", "(no Location header)")
-                # Step 3: follow redirect if any
-                loc2 = r2.headers.get("Location", "")
-                if loc2:
-                    if not loc2.startswith("http"):
-                        loc2 = _urljoin(PANOPTO_BASE, loc2)
-                    r3 = sf.get(loc2, allow_redirects=True, timeout=12)
-                    out["pan_step3_url"] = r3.url[:120]
-                    out["pan_step3_html_snippet"] = r3.text[:400]
+                    out["moodle2025_ctx"] = "NOT FOUND IN PAGE HTML"
+
+                # Find all <a> tags — one of them is probably the Moodle login link
+                all_links = [(a.get("href","")[:80], a.get("onclick","")[:80])
+                             for a in soup1.find_all("a") if a.get("href") or a.get("onclick")]
+                out["pan_links"] = str(all_links[:8])
+
+                # Any JSON blobs containing auth provider info
+                json_with_auth = [m[:200] for m in re.findall(r'\{[^{}]{20,400}\}', r1.text)
+                                  if any(k in m.lower() for k in ('moodle', 'provider', 'authcas'))]
+                out["pan_json_auth"] = str(json_with_auth[:3])
+
+                # Also try GET with allow_redirects=False to see if there's an immediate redirect
+                r1b = sf.get(f"{PANOPTO_BASE}/Panopto/Pages/Auth/Login.aspx",
+                             params={"authCAS": "Moodle2025"}, allow_redirects=False, timeout=10)
+                out["pan_get_nodirect_status"] = r1b.status_code
+                out["pan_get_nodirect_location"] = r1b.headers.get("Location", "(none)")
             else:
                 out["pan_step1_form"] = "NO FORM FOUND"
                 out["pan_step1_js_url"] = str(_extract_js_url_debug(r1.text, r1.url))
