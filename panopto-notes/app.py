@@ -441,47 +441,26 @@ def index():
 
 @app.route("/debug")
 def debug():
-    """Check cookie auth and try many API paths."""
+    """Fast auth check — only tests WebMethod endpoint."""
     out = {}
     try:
         s = get_session()
         csrf = s.cookies.get("csrfToken", "")
-        hdrs = {"X-CSRF-Token": csrf, "Accept": "application/json"}
+        hdrs = {"X-CSRF-Token": csrf, "Accept": "application/json",
+                "Content-Type": "application/json; charset=UTF-8"}
         out["cookies"] = list(s.cookies.keys())
-        out["csrf"] = csrf[:20] + "..." if len(csrf) > 20 else csrf
+        out["has_aspxauth"] = ".ASPXAUTH" in [c.name for c in s.cookies]
 
-        # Try many API paths
-        paths = [
-            "/Panopto/api/v1/sessions",
-            "/Panopto/api/v4.2/sessions",
-            "/Panopto/api/v4.6/sessions",
-            "/Panopto/api/4.2/sessions",
-            "/Panopto/api/4.6/sessions",
-            "/Panopto/Services/Data.svc/GetSessionsList",
-            "/Panopto/Pages/Sessions/List.aspx",
-        ]
-        for path in paths:
-            try:
-                rv = s.get(f"{PANOPTO_BASE}{path}",
-                           params={"maxResults": 3},
-                           headers=hdrs, timeout=10)
-                out[path] = f"{rv.status_code} | {rv.text[:120]}"
-            except Exception as ex:
-                out[path] = f"ERR: {ex}"
-
-        # Test WebMethod with different scopes and no date filter
         for scope in [0, 1, 2, 3]:
             try:
                 payload = {"queryParameters": {"query": "", "sortColumn": 1, "sortAscending": False,
                            "maxResults": 5, "page": 0, "startDate": None, "endDate": None,
                            "folderID": None, "bookmarked": False, "sessionListScope": scope}}
                 rv = s.post(f"{PANOPTO_BASE}/Panopto/Pages/Sessions/List.aspx/GetSessions",
-                            json=payload,
-                            headers={**hdrs, "Content-Type": "application/json; charset=UTF-8"},
-                            timeout=15)
-                out[f"WebMethod scope={scope}"] = f"{rv.status_code} | {rv.text[:300]}"
+                            json=payload, headers=hdrs, timeout=15)
+                out[f"scope={scope}"] = f"HTTP {rv.status_code} | {rv.text[:400]}"
             except Exception as ex:
-                out[f"WebMethod scope={scope}"] = f"ERR: {ex}"
+                out[f"scope={scope}"] = f"ERR: {ex}"
 
         lines = "\n\n".join(f"{k}:\n  {v}" for k, v in out.items())
         body = f"""
