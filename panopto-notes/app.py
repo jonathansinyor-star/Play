@@ -146,19 +146,28 @@ def _try_sso_login():
 
         The browser onclick handler does:
             window.location.search += '&instance=Moodle2025'; return false;
-        i.e. it navigates to Login.aspx?authCAS=X&instance=X and the server
-        then does a Response.Redirect to the provider's SAML/auth endpoint.
-        No form POST involved — the doPostBack href is cancelled by return false.
+        The server returns 200 with JavaScript that reads the instance param
+        and builds the Moodle SAML auth URL. We must find that URL in the body.
         """
         try:
+            # sandboxCookie proves cookies work (set by Panopto.Login.checkStorageAccess())
+            s.cookies.set("sandboxCookie", "1", domain="tau.cloud.panopto.eu")
             s.cookies.set("UserSettings", f"LastLoginMembershipProvider={auth_cas}",
                           domain="tau.cloud.panopto.eu")
-            # Replicate the onclick: GET with instance= added to query string
+
+            # First visit Login.aspx without instance= to get session cookies
+            r0 = s.get(f"{PANOPTO_BASE}/Panopto/Pages/Auth/Login.aspx",
+                       params={"authCAS": auth_cas}, allow_redirects=True, timeout=20)
+            _sso_last_error_parts.append(f"{auth_cas}→{r0.url[:60]}")
+            if any(c.name == ".ASPXAUTH" for c in s.cookies):
+                return True
+
+            # Now add instance= to trigger the JS-initiated auth flow
             r = s.get(f"{PANOPTO_BASE}/Panopto/Pages/Auth/Login.aspx",
                       params={"authCAS": auth_cas, "instance": auth_cas},
                       allow_redirects=False, timeout=20)
             loc = r.headers.get("Location", "")
-            _sso_last_error_parts.append(f"{auth_cas}&inst→{r.status_code} loc={loc[:80]}")
+            _sso_last_error_parts.append(f"+inst→{r.status_code} loc={loc[:80]}")
 
             if r.status_code in (301, 302, 303, 307, 308) and loc:
                 if not loc.startswith("http"):
@@ -169,13 +178,22 @@ def _try_sso_login():
                     return True
                 _follow_relays(r2)
             elif r.status_code == 200:
-                # Server didn't redirect — follow anyway in case of JS redirect in body
-                r2 = s.get(f"{PANOPTO_BASE}/Panopto/Pages/Auth/Login.aspx",
-                           params={"authCAS": auth_cas, "instance": auth_cas},
-                           allow_redirects=True, timeout=20)
-                _sso_last_error_parts.append(f"200follow→{r2.url[:70]}")
-                if PANOPTO_BASE not in r2.url:
-                    _follow_relays(r2)
+                # JS redirect in body — check with _follow_relays and direct URL search
+                _follow_relays(r)
+                if not any(c.name == ".ASPXAUTH" for c in s.cookies):
+                    # Search body for moodle/auth URLs and navigate to them
+                    body_urls = re.findall(
+                        r'https?://[^\s"\'<>]*(?:moodle|saml|nidp|sso)[^\s"\'<>]*',
+                        r.text, re.I)
+                    for burl in body_urls[:3]:
+                        try:
+                            r_b = s.get(burl, allow_redirects=True, timeout=20)
+                            _sso_last_error_parts.append(f"body→{r_b.url[:60]}")
+                            _follow_relays(r_b)
+                            if any(c.name == ".ASPXAUTH" for c in s.cookies):
+                                return True
+                        except Exception:
+                            pass
         except Exception as e:
             _sso_last_error_parts.append(f"err:{e}")
         return any(c.name == ".ASPXAUTH" for c in s.cookies)
@@ -788,12 +806,26 @@ def debug():
                                   if any(k in m.lower() for k in ('moodle', 'provider', 'authcas'))]
                 out["pan_json_auth"] = str(json_with_auth[:3])
 
-                # THE KEY TEST: GET with instance= (what the onclick JS does)
+                # KEY: GET with instance= + sandboxCookie (mimics what browser does after onclick)
+                sf.cookies.set("sandboxCookie", "1", domain="tau.cloud.panopto.eu")
                 r_inst = sf.get(f"{PANOPTO_BASE}/Panopto/Pages/Auth/Login.aspx",
                                 params={"authCAS": "Moodle2025", "instance": "Moodle2025"},
                                 allow_redirects=False, timeout=10)
                 out["pan_instance_status"] = r_inst.status_code
-                out["pan_instance_location"] = r_inst.headers.get("Location", "(none — no redirect)")
+                out["pan_instance_location"] = r_inst.headers.get("Location", "(none)")
+                # Show body to find the JS-embedded auth URL
+                out["pan_instance_body_start"] = r_inst.text[:600]
+                # Find moodle/saml/auth URLs embedded in the body
+                inst_urls = re.findall(
+                    r'https?://[^\s"\'\\<>]*(?:moodle|saml|nidp|sso|auth)[^\s"\'\\<>]*',
+                    r_inst.text, re.I)
+                out["pan_instance_auth_urls"] = str(inst_urls[:6])
+                # Check for any JS redirect patterns in the body
+                out["pan_instance_js_redir"] = str(_extract_js_url_debug(r_inst.text, r_inst.url))
+                # Show any JSON blobs mentioning providers
+                inst_json = [m[:200] for m in re.findall(r'\{[^{}]{20,300}\}', r_inst.text)
+                             if any(k in m.lower() for k in ('moodle','provider','redirect','saml','url'))]
+                out["pan_instance_json"] = str(inst_json[:3])
             else:
                 out["pan_step1_form"] = "NO FORM FOUND"
                 out["pan_step1_js_url"] = str(_extract_js_url_debug(r1.text, r1.url))
