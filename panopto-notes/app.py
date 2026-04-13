@@ -806,6 +806,8 @@ def debug():
                 action1 = form1.get("action") or r1.url
                 if not action1.startswith("http"):
                     action1 = _urljoin(r1.url, action1)
+                inp_names = {i.get("name"): i.get("value","")[:30]
+                             for i in form1.find_all("input") if i.get("name")}
                 out["pan_form_field_names"] = str(list(inp_names.keys()))
 
                 # THE KEY: find 'Moodle2025' in the page and show surrounding context
