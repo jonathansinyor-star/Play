@@ -469,18 +469,19 @@ def debug():
             except Exception as ex:
                 out[path] = f"ERR: {ex}"
 
-        # Also test the internal WebMethod POST
-        try:
-            payload = {"queryParameters": {"query": "", "sortColumn": 1, "sortAscending": False,
-                       "maxResults": 3, "page": 0, "startDate": None, "endDate": None,
-                       "folderID": None, "bookmarked": False, "sessionListScope": 2}}
-            rv = s.post(f"{PANOPTO_BASE}/Panopto/Pages/Sessions/List.aspx/GetSessions",
-                        json=payload,
-                        headers={**hdrs, "Content-Type": "application/json; charset=UTF-8"},
-                        timeout=15)
-            out["GetSessions WebMethod (POST)"] = f"{rv.status_code} | {rv.text[:200]}"
-        except Exception as ex:
-            out["GetSessions WebMethod (POST)"] = f"ERR: {ex}"
+        # Test WebMethod with different scopes and no date filter
+        for scope in [0, 1, 2, 3]:
+            try:
+                payload = {"queryParameters": {"query": "", "sortColumn": 1, "sortAscending": False,
+                           "maxResults": 5, "page": 0, "startDate": None, "endDate": None,
+                           "folderID": None, "bookmarked": False, "sessionListScope": scope}}
+                rv = s.post(f"{PANOPTO_BASE}/Panopto/Pages/Sessions/List.aspx/GetSessions",
+                            json=payload,
+                            headers={**hdrs, "Content-Type": "application/json; charset=UTF-8"},
+                            timeout=15)
+                out[f"WebMethod scope={scope}"] = f"{rv.status_code} | {rv.text[:300]}"
+            except Exception as ex:
+                out[f"WebMethod scope={scope}"] = f"ERR: {ex}"
 
         lines = "\n\n".join(f"{k}:\n  {v}" for k, v in out.items())
         body = f"""
