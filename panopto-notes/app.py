@@ -54,8 +54,69 @@ def reset_session():
 # Panopto API
 # ---------------------------------------------------------------------------
 
+def _parse_ms_date(date_str):
+    """Parse Panopto's /Date(ms)/ or ISO string to ISO string."""
+    if not date_str:
+        return ""
+    m = re.match(r"/Date\((-?\d+)", date_str)
+    if m:
+        from datetime import timezone
+        dt = datetime.fromtimestamp(int(m.group(1)) / 1000, tz=timezone.utc)
+        return dt.isoformat()
+    return date_str
+
+
+def _webmethod_sessions(s, max_results=100):
+    """Call Panopto's internal GetSessions WebMethod (what the web app uses)."""
+    csrf = s.cookies.get("csrfToken", "")
+    payload = {
+        "queryParameters": {
+            "query": "",
+            "sortColumn": 1,
+            "sortAscending": False,
+            "maxResults": max_results,
+            "page": 0,
+            "startDate": SINCE_DATE,
+            "endDate": None,
+            "folderID": None,
+            "bookmarked": False,
+            "sessionListScope": 2,  # 2 = Shared with me
+        }
+    }
+    r = s.post(
+        f"{PANOPTO_BASE}/Panopto/Pages/Sessions/List.aspx/GetSessions",
+        json=payload,
+        headers={"X-CSRF-Token": csrf, "Accept": "application/json",
+                 "Content-Type": "application/json; charset=UTF-8"},
+        timeout=30,
+    )
+    r.raise_for_status()
+    raw = r.json().get("d", {}).get("Results", [])
+    results = []
+    for item in raw:
+        results.append({
+            "Id": item.get("DeliveryID") or item.get("Id", ""),
+            "Name": item.get("SessionName") or item.get("Name", "Untitled"),
+            "StartTime": _parse_ms_date(item.get("StartTime", "")),
+            "Duration": item.get("Duration"),
+            "DownloadUrl": (item.get("Urls") or {}).get("Download") or item.get("IosVideoUrl"),
+            "CaptionDownloadUrl": (item.get("Urls") or {}).get("CaptionsDownload"),
+        })
+    return results
+
+
 def list_shared_sessions():
     s = get_session()
+
+    # Try the internal WebMethod first (works when REST API version is unsupported)
+    try:
+        results = _webmethod_sessions(s)
+        if results is not None:
+            return results
+    except Exception:
+        pass
+
+    # Fall back to REST API v1
     params = {
         "isSharedWithMe": "true",
         "sortField": "StartTime",
@@ -85,8 +146,19 @@ def list_shared_sessions():
 
 def get_session_detail(session_id):
     s = get_session()
+    # Try REST API first, fall back to looking in the session list
     r = s.get(f"{PANOPTO_BASE}/Panopto/api/v1/sessions/{session_id}", timeout=20)
-    return r.json()
+    if r.ok:
+        return r.json()
+    # If REST API fails, fetch from WebMethod and find the matching session
+    try:
+        all_sessions = _webmethod_sessions(s, max_results=200)
+        for sess in all_sessions:
+            if sess.get("Id") == session_id:
+                return sess
+    except Exception:
+        pass
+    return {}
 
 
 # ---------------------------------------------------------------------------
@@ -396,6 +468,19 @@ def debug():
                 out[path] = f"{rv.status_code} | {rv.text[:120]}"
             except Exception as ex:
                 out[path] = f"ERR: {ex}"
+
+        # Also test the internal WebMethod POST
+        try:
+            payload = {"queryParameters": {"query": "", "sortColumn": 1, "sortAscending": False,
+                       "maxResults": 3, "page": 0, "startDate": None, "endDate": None,
+                       "folderID": None, "bookmarked": False, "sessionListScope": 2}}
+            rv = s.post(f"{PANOPTO_BASE}/Panopto/Pages/Sessions/List.aspx/GetSessions",
+                        json=payload,
+                        headers={**hdrs, "Content-Type": "application/json; charset=UTF-8"},
+                        timeout=15)
+            out["GetSessions WebMethod (POST)"] = f"{rv.status_code} | {rv.text[:200]}"
+        except Exception as ex:
+            out["GetSessions WebMethod (POST)"] = f"ERR: {ex}"
 
         lines = "\n\n".join(f"{k}:\n  {v}" for k, v in out.items())
         body = f"""
