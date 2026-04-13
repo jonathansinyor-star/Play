@@ -144,11 +144,22 @@ def _try_sso_login():
     def _panopto_force_auth(auth_cas):
         """GET Panopto Login.aspx and submit ViewState to trigger provider redirect."""
         try:
+            # Tell Panopto which provider to use via the UserSettings cookie — this
+            # sometimes causes Panopto to skip the chooser and redirect directly.
+            s.cookies.set("UserSettings", f"LastLoginMembershipProvider={auth_cas}",
+                          domain="tau.cloud.panopto.eu")
             r = s.get(f"{PANOPTO_BASE}/Panopto/Pages/Auth/Login.aspx",
                       params={"authCAS": auth_cas}, allow_redirects=True, timeout=20)
             _sso_last_error_parts.append(f"{auth_cas}→{r.url[:60]}")
             if any(c.name == ".ASPXAUTH" for c in s.cookies):
                 return True
+
+            # If we already left Panopto (redirect happened), follow the chain
+            if PANOPTO_BASE not in r.url:
+                _follow_relays(r)
+                if any(c.name == ".ASPXAUTH" for c in s.cookies):
+                    return True
+
             soup = BeautifulSoup(r.text, "html.parser")
             form = soup.find("form")
             if not form:
@@ -164,18 +175,34 @@ def _try_sso_login():
                     if r2:
                         _follow_relays(r2)
                 else:
-                    # ViewState / login-chooser form — set forceStateChanged and POST
+                    # ViewState / login-chooser form
                     action = form.get("action") or r.url
                     if not action.startswith("http"):
                         action = urljoin(r.url, action)
                     data = {i["name"]: i.get("value", "")
                             for i in form.find_all("input") if i.get("name")}
+                    # Set forceStateChanged — JS adds this field dynamically in the browser;
+                    # we must inject it explicitly with the known ASP.NET control ID.
+                    data["ctl00$PageContentPlaceholder$loginControl$forceStateChanged"] = auth_cas
                     for k in list(data.keys()):
-                        if "forceState" in k or "loginControl" in k:
+                        if "forceState" in k:
                             data[k] = auth_cas
-                    r2 = s.post(action, data=data, allow_redirects=True, timeout=20)
-                    _sso_last_error_parts.append(f"force→{r2.url[:50]}")
-                    _follow_relays(r2)
+
+                    # POST with allow_redirects=False first to see WHERE Panopto sends us
+                    r_post = s.post(action, data=data, allow_redirects=False, timeout=20)
+                    loc = r_post.headers.get("Location", "")
+                    _sso_last_error_parts.append(f"POST→{r_post.status_code} loc={loc[:80]}")
+
+                    if r_post.status_code in (301, 302, 303, 307, 308) and loc:
+                        # Follow from the redirect target
+                        if not loc.startswith("http"):
+                            loc = urljoin(PANOPTO_BASE, loc)
+                        r2 = s.get(loc, allow_redirects=True, timeout=20)
+                        _sso_last_error_parts.append(f"→{r2.url[:60]}")
+                        _follow_relays(r2)
+                    elif r_post.status_code == 200:
+                        # Stayed on same page — try following relays on the response
+                        _follow_relays(r_post)
         except Exception as e:
             _sso_last_error_parts.append(f"err:{e}")
         return any(c.name == ".ASPXAUTH" for c in s.cookies)
@@ -702,6 +729,22 @@ def set_cookie():
     return PAGE.format(body=body)
 
 
+def _extract_js_url_debug(html_text, base):
+    """Standalone JS redirect extractor for use outside SSO function."""
+    from urllib.parse import urljoin
+    for pat in [
+        r'location\.href\s*=\s*["\']([^"\']{10,})["\']',
+        r'location\.replace\s*\(\s*["\']([^"\']{10,})["\']',
+        r'window\.location\s*=\s*["\']([^"\']{10,})["\']',
+        r'<meta[^>]+http-equiv=["\']refresh["\'][^>]+content=["\'][^;]+;\s*url=([^"\'>\s]+)',
+    ]:
+        m = re.search(pat, html_text, re.IGNORECASE)
+        if m:
+            u = m.group(1).strip().strip('"\'')
+            return u if u.startswith("http") else urljoin(base, u)
+    return None
+
+
 @app.route("/debug")
 def debug():
     """Auth diagnostics — shows SSO trace, cookies, WebMethod result, and Moodle page source."""
@@ -723,17 +766,49 @@ def debug():
         out["cookies"] = list(s.cookies.keys())
         out["has_aspxauth"] = ".ASPXAUTH" in [c.name for c in s.cookies]
 
-        # Moodle login page source (fresh session, no cookies) — reveals JS redirect target
+        # Step-by-step Panopto Login.aspx POST trace (fresh session, no cookies)
+        # This tells us: does Panopto redirect to Moodle/NetIQ, or loop back?
         moodle_base = os.environ.get("MOODLE_URL", "https://moodle.tau.ac.il").rstrip("/")
         try:
+            from bs4 import BeautifulSoup as _BS
             sf = req.Session()
             sf.headers["User-Agent"] = UA
-            rm = sf.get(f"{moodle_base}/login/index.php", allow_redirects=True, timeout=10)
-            out["moodle_login_url"] = rm.url[:120]
-            # Show first 600 chars of HTML so we can see JS redirects / forms
-            out["moodle_login_html"] = rm.text[:600]
+            sf.cookies.set("UserSettings", "LastLoginMembershipProvider=Moodle2025",
+                           domain="tau.cloud.panopto.eu")
+            # Step 1: GET Login.aspx
+            r1 = sf.get(f"{PANOPTO_BASE}/Panopto/Pages/Auth/Login.aspx",
+                        params={"authCAS": "Moodle2025"}, allow_redirects=True, timeout=12)
+            out["pan_step1_url"] = r1.url[:120]
+            out["pan_step1_html_snippet"] = r1.text[:400]
+            # Step 2: POST ViewState form with forceStateChanged
+            soup1 = _BS(r1.text, "html.parser")
+            form1 = soup1.find("form")
+            if form1:
+                action1 = form1.get("action") or r1.url
+                if not action1.startswith("http"):
+                    from urllib.parse import urljoin as _urljoin
+                    action1 = _urljoin(r1.url, action1)
+                data1 = {i["name"]: i.get("value", "")
+                         for i in form1.find_all("input") if i.get("name")}
+                data1["ctl00$PageContentPlaceholder$loginControl$forceStateChanged"] = "Moodle2025"
+                r2 = sf.post(action1, data=data1, allow_redirects=False, timeout=12)
+                out["pan_step2_status"] = r2.status_code
+                out["pan_step2_location"] = r2.headers.get("Location", "(no Location header)")
+                out["pan_step2_body_snippet"] = r2.text[:200]
+                # Step 3: follow the redirect if there was one
+                loc2 = r2.headers.get("Location", "")
+                if loc2:
+                    if not loc2.startswith("http"):
+                        from urllib.parse import urljoin as _urljoin2
+                        loc2 = _urljoin2(PANOPTO_BASE, loc2)
+                    r3 = sf.get(loc2, allow_redirects=True, timeout=12)
+                    out["pan_step3_url"] = r3.url[:120]
+                    out["pan_step3_html_snippet"] = r3.text[:500]
+            else:
+                out["pan_step1_form"] = "NO FORM FOUND"
+                out["pan_step1_js_url"] = str(_extract_js_url_debug(r1.text, r1.url))
         except Exception as ex:
-            out["moodle_login_html"] = f"ERR: {ex}"
+            out["pan_trace_err"] = str(ex)
 
         # Test WebMethod with decoded CSRF token
         try:
