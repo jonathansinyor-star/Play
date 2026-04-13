@@ -56,7 +56,6 @@ def reset_session():
 
 def list_shared_sessions():
     s = get_session()
-    base = _api_base or f"{PANOPTO_BASE}/Panopto/api/v1"
     params = {
         "isSharedWithMe": "true",
         "sortField": "StartTime",
@@ -64,14 +63,13 @@ def list_shared_sessions():
         "pagination[maxResults]": 100,
         "minStartDate": SINCE_DATE,
     }
-    r = s.get(f"{base}/sessions", params=params, timeout=30)
+    r = s.get(f"{PANOPTO_BASE}/Panopto/api/v1/sessions", params=params, timeout=30)
     if r.status_code == 401:
         reset_session()
         s = get_session()
-        r = s.get(f"{base}/sessions", params=params, timeout=30)
+        r = s.get(f"{PANOPTO_BASE}/Panopto/api/v1/sessions", params=params, timeout=30)
     data = r.json()
     results = data.get("Results", [])
-    # Filter by date client-side as a safety net
     since = datetime(2026, 3, 1)
     filtered = []
     for item in results:
@@ -87,8 +85,7 @@ def list_shared_sessions():
 
 def get_session_detail(session_id):
     s = get_session()
-    base = _api_base or f"{PANOPTO_BASE}/Panopto/api/v1"
-    r = s.get(f"{base}/sessions/{session_id}", timeout=20)
+    r = s.get(f"{PANOPTO_BASE}/Panopto/api/v1/sessions/{session_id}", timeout=20)
     return r.json()
 
 
