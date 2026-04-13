@@ -369,20 +369,38 @@ def index():
 
 @app.route("/debug")
 def debug():
-    """Check cookie auth and API connectivity."""
+    """Check cookie auth and try many API paths."""
     out = {}
     try:
         s = get_session()
-        out["cookie_set"] = bool(os.environ.get("PANOPTO_COOKIE"))
-        out["cookies_in_session"] = list(s.cookies.keys())
-        for ver in ["v1", "4.2", "4.6"]:
-            rv = s.get(f"{PANOPTO_BASE}/Panopto/api/{ver}/sessions",
-                       params={"pagination[maxResults]": 3}, timeout=15)
-            out[f"api_{ver}"] = f"{rv.status_code}: {rv.text[:300]}"
+        csrf = s.cookies.get("csrfToken", "")
+        hdrs = {"X-CSRF-Token": csrf, "Accept": "application/json"}
+        out["cookies"] = list(s.cookies.keys())
+        out["csrf"] = csrf[:20] + "..." if len(csrf) > 20 else csrf
+
+        # Try many API paths
+        paths = [
+            "/Panopto/api/v1/sessions",
+            "/Panopto/api/v4.2/sessions",
+            "/Panopto/api/v4.6/sessions",
+            "/Panopto/api/4.2/sessions",
+            "/Panopto/api/4.6/sessions",
+            "/Panopto/Services/Data.svc/GetSessionsList",
+            "/Panopto/Pages/Sessions/List.aspx",
+        ]
+        for path in paths:
+            try:
+                rv = s.get(f"{PANOPTO_BASE}{path}",
+                           params={"maxResults": 3},
+                           headers=hdrs, timeout=10)
+                out[path] = f"{rv.status_code} | {rv.text[:120]}"
+            except Exception as ex:
+                out[path] = f"ERR: {ex}"
+
         lines = "\n\n".join(f"{k}:\n  {v}" for k, v in out.items())
         body = f"""
         <h1>Debug</h1>
-        <div class="card"><pre style="white-space:pre-wrap;font-size:0.72rem;color:#94a3b8">{lines}</pre></div>
+        <div class="card"><pre style="white-space:pre-wrap;font-size:0.7rem;color:#94a3b8">{lines}</pre></div>
         <a href="/" class="btn btn-primary">Back</a>"""
     except Exception as e:
         body = f'<h1>Debug Error</h1><div class="alert alert-err">{e}</div>'
