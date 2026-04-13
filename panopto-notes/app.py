@@ -185,8 +185,28 @@ def _try_sso_login():
                     base_data = {i["name"]: i.get("value", "")
                                  for i in form.find_all("input") if i.get("name")}
 
-                    # Extract __doPostBack targets from the page
-                    dopost = re.findall(r"__doPostBack\('([^']+)','([^']*)'\)", r.text)
+                    # Extract __doPostBack targets — search BS4-decoded href/onclick attrs
+                    # (raw HTML uses &#39; entities which fool regex on r.text)
+                    dopost = []
+                    for a_tag in soup.find_all("a"):
+                        for attr in ("href", "onclick"):
+                            val = a_tag.get(attr, "")
+                            m = re.search(r"__doPostBack\('([^']+)','([^']*)'\)", val)
+                            if m:
+                                dopost.append((m.group(1), m.group(2)))
+
+                    # Fallback: raw HTML with &#39; entity decoding
+                    if not dopost:
+                        decoded = r.text.replace("&#39;", "'")
+                        dopost = re.findall(r"__doPostBack\('([^']+)','([^']*)'\)", decoded)
+
+                    # Hardcoded fallback based on debug-observed control ID prefix
+                    if not dopost:
+                        dopost = [
+                            ("ctl00$PageContentPlaceholder$loginControl$externalLogin", auth_cas),
+                            ("ctl00$PageContentPlaceholder$loginControl$externalLogin$ctl00$lnkLogin", auth_cas),
+                        ]
+                    _sso_last_error_parts.append(f"dopost={[t for t,_ in dopost[:3]]}")
 
                     def _try_post(extra_fields):
                         d = dict(base_data)
@@ -194,35 +214,23 @@ def _try_sso_login():
                         rp = s.post(action, data=d, allow_redirects=False, timeout=20)
                         loc = rp.headers.get("Location", "")
                         _sso_last_error_parts.append(
-                            f"POST→{rp.status_code} loc={loc[:60]}")
+                            f"POST→{rp.status_code} loc={loc[:70]}")
                         if rp.status_code in (301, 302, 303, 307, 308) and loc:
                             if not loc.startswith("http"):
                                 loc = urljoin(PANOPTO_BASE, loc)
                             r2 = s.get(loc, allow_redirects=True, timeout=20)
-                            _sso_last_error_parts.append(f"→{r2.url[:60]}")
+                            _sso_last_error_parts.append(f"→{r2.url[:70]}")
                             _follow_relays(r2)
                             return True
+                        elif rp.status_code == 200:
+                            # Panopto sometimes does a JS redirect in the 200 body
+                            _follow_relays(rp)
                         return False
 
-                    # Try each doPostBack target found on the page
                     for target, arg in dopost:
-                        if _try_post({"__EVENTTARGET": target, "__EVENTARGUMENT": arg}):
-                            if any(c.name == ".ASPXAUTH" for c in s.cookies):
-                                break
-
-                    # If no doPostBack found or none worked, try known field name patterns
-                    if not any(c.name == ".ASPXAUTH" for c in s.cookies):
-                        for extra in [
-                            {"__EVENTTARGET": "ctl00$PageContentPlaceholder$loginControl$lbtnLogin",
-                             "__EVENTARGUMENT": auth_cas},
-                            {"forceStateChanged": auth_cas,
-                             "ctl00$PageContentPlaceholder$loginControl$forceStateChanged": auth_cas},
-                            {"__EVENTTARGET": "ctl00$PageContentPlaceholder$loginControl$loginButton",
-                             "__EVENTARGUMENT": ""},
-                        ]:
-                            if _try_post(extra):
-                                if any(c.name == ".ASPXAUTH" for c in s.cookies):
-                                    break
+                        _try_post({"__EVENTTARGET": target, "__EVENTARGUMENT": arg})
+                        if any(c.name == ".ASPXAUTH" for c in s.cookies):
+                            break
         except Exception as e:
             _sso_last_error_parts.append(f"err:{e}")
         return any(c.name == ".ASPXAUTH" for c in s.cookies)
@@ -818,10 +826,17 @@ def debug():
                 else:
                     out["moodle2025_ctx"] = "NOT FOUND IN PAGE HTML"
 
-                # Find all <a> tags — one of them is probably the Moodle login link
-                all_links = [(a.get("href","")[:80], a.get("onclick","")[:80])
-                             for a in soup1.find_all("a") if a.get("href") or a.get("onclick")]
-                out["pan_links"] = str(all_links[:8])
+                # Show full href/onclick of doPostBack links (200 chars, untruncated)
+                dopost_links = []
+                for a in soup1.find_all("a"):
+                    h = a.get("href",""); oc = a.get("onclick","")
+                    if "doPostBack" in h or "doPostBack" in oc:
+                        dopost_links.append({"href": h[:200], "onclick": oc[:200]})
+                out["pan_dopost_links"] = str(dopost_links[:4])
+                # Decode &#39; and extract doPostBack args
+                decoded_html = r1.text.replace("&#39;","'")
+                dopost_raw = re.findall(r"__doPostBack\('([^']+)','([^']*)'\)", decoded_html)
+                out["pan_dopostback_decoded"] = str(dopost_raw[:6])
 
                 # Any JSON blobs containing auth provider info
                 json_with_auth = [m[:200] for m in re.findall(r'\{[^{}]{20,400}\}', r1.text)
