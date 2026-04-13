@@ -29,13 +29,12 @@ UA = ("Mozilla/5.0 (iPad; CPU OS 17_0 like Mac OS X) "
 
 
 def _try_sso_login():
-    """Log in via Moodle → NetIQ → Panopto. Returns requests.Session or None."""
+    """Log in via SSO — tries three independent strategies. Returns requests.Session or None."""
     from bs4 import BeautifulSoup
     from urllib.parse import urljoin
 
     global _sso_last_error
     username = os.environ.get("MOODLE_USERNAME", "")
-    moodle_id = os.environ.get("MOODLE_ID", "")
     password = os.environ.get("MOODLE_PASSWORD", "")
     moodle_base = os.environ.get("MOODLE_URL", "https://moodle.tau.ac.il").rstrip("/")
 
@@ -46,125 +45,210 @@ def _try_sso_login():
     s = req.Session()
     s.headers["User-Agent"] = UA
 
-    def _fill_and_post(r):
-        """Fill credentials into first form found, post it, return new response."""
-        soup = BeautifulSoup(r.text, "html.parser")
+    # ── helpers ──────────────────────────────────────────────────────────────
+
+    def _extract_js_url(html, base):
+        """Find redirect URL embedded in JavaScript or meta-refresh on the page."""
+        for pat in [
+            r'location\.href\s*=\s*["\']([^"\']{10,})["\']',
+            r'location\.replace\s*\(\s*["\']([^"\']{10,})["\']',
+            r'window\.location\s*=\s*["\']([^"\']{10,})["\']',
+            r'<meta[^>]+http-equiv=["\']refresh["\'][^>]+content=["\'][^;]+;\s*url=([^"\'>\s]+)',
+        ]:
+            m = re.search(pat, html, re.IGNORECASE)
+            if m:
+                u = m.group(1).strip().strip('"\'')
+                return u if u.startswith("http") else urljoin(base, u)
+        return None
+
+    def _fill_and_post(resp):
+        """Fill credentials into the first form found and POST it."""
+        soup = BeautifulSoup(resp.text, "html.parser")
         form = soup.find("form")
         if not form:
             return None
-        action = form.get("action", r.url)
+        action = form.get("action") or resp.url
         if not action.startswith("http"):
-            action = urljoin(r.url, action)
-        data = {inp["name"]: inp.get("value", "")
-                for inp in form.find_all("input") if inp.get("name")}
-        text_f = [inp["name"] for inp in form.find_all("input")
-                  if inp.get("name") and inp.get("type", "text").lower() in ("text", "email", "")]
-        pass_f  = [inp["name"] for inp in form.find_all("input")
-                   if inp.get("name") and inp.get("type", "").lower() == "password"]
-        for k in ["Ecom_User_ID", "username", "loginname", "j_username"]:
+            action = urljoin(resp.url, action)
+        data = {i["name"]: i.get("value", "")
+                for i in form.find_all("input") if i.get("name")}
+        pass_fields = [i["name"] for i in form.find_all("input", {"type": "password"}) if i.get("name")]
+        text_fields = [i["name"] for i in form.find_all("input")
+                       if i.get("name") and i.get("type", "text").lower() in ("text", "email", "")]
+        for k in ("Ecom_User_ID", "username", "loginname", "j_username", "userid", "user"):
             if k in data:
                 data[k] = username
                 break
         else:
-            if text_f:
-                data[text_f[0]] = username
-        if moodle_id and len(text_f) >= 2:
-            data[text_f[1]] = moodle_id
-        for k in ["Ecom_Password", "password", "passwd", "j_password"]:
+            if text_fields:
+                data[text_fields[0]] = username
+        for k in ("Ecom_Password", "password", "passwd", "j_password"):
             if k in data:
                 data[k] = password
                 break
         else:
-            if pass_f:
-                data[pass_f[0]] = password
+            if pass_fields:
+                data[pass_fields[0]] = password
         try:
             return s.post(action, data=data, allow_redirects=True, timeout=30)
         except Exception:
             return None
 
-    def _follow_relays(r, max_steps=5):
-        """Follow SAML/CAS auto-submit relay forms."""
-        for _ in range(max_steps):
+    def _follow_relays(resp, depth=10):
+        """Follow SAML relay forms, password forms, and JS redirects until .ASPXAUTH appears."""
+        r = resp
+        for _ in range(depth):
             if any(c.name == ".ASPXAUTH" for c in s.cookies):
                 break
             soup = BeautifulSoup(r.text, "html.parser")
             form = soup.find("form")
-            if not form:
-                break
-            ra = form.get("action", "")
-            if not ra:
-                break
-            if not ra.startswith("http"):
-                ra = urljoin(r.url, ra)
-            rd = {inp["name"]: inp.get("value", "")
-                  for inp in form.find_all("input") if inp.get("name")}
-            relay_keys = ("SAMLResponse", "RelayState", "lt", "ticket", "execution", "SAMLRequest")
-            has_pass = bool(form.find("input", {"type": "password"}))
-            if has_pass:
+
+            # Password form — submit credentials
+            if form and form.find("input", {"type": "password"}):
                 r2 = _fill_and_post(r)
-                if not r2:
-                    break
-                r = r2
-                _sso_last_error += f" | creds→{r.url[:50]}"
-            elif any(k in rd for k in relay_keys):
+                if r2:
+                    r = r2
+                    _sso_last_error += f" | creds→{r.url[:50]}"
+                    continue
+                break
+
+            # SAML/CAS auto-submit relay form
+            if form:
+                ra = form.get("action", "")
+                rd = {i["name"]: i.get("value", "")
+                      for i in form.find_all("input") if i.get("name")}
+                relay_keys = ("SAMLResponse", "RelayState", "SAMLRequest",
+                              "wresult", "wctx", "lt", "execution", "ticket")
+                if ra and any(k in rd for k in relay_keys):
+                    if not ra.startswith("http"):
+                        ra = urljoin(r.url, ra)
+                    try:
+                        r = s.post(ra, data=rd, allow_redirects=True, timeout=20)
+                        _sso_last_error += f" | relay→{r.url[:50]}"
+                        continue
+                    except Exception:
+                        break
+
+            # JS / meta-refresh redirect
+            js_url = _extract_js_url(r.text, r.url)
+            if js_url and js_url != r.url:
                 try:
-                    r = s.post(ra, data=rd, allow_redirects=True, timeout=20)
-                    _sso_last_error += f" | relay→{r.url[:50]}"
+                    r = s.get(js_url, allow_redirects=True, timeout=20)
+                    _sso_last_error += f" | js→{r.url[:50]}"
+                    continue
                 except Exception:
                     break
-            else:
-                break
+            break
         return r
 
-    # ── 1. Start at Moodle login (redirects to NetIQ plain-HTML form) ──
-    try:
-        r = s.get(f"{moodle_base}/login/index.php", allow_redirects=True, timeout=20)
-        _sso_last_error = f"1.moodle→{r.url[:70]}"
-    except Exception as e:
-        _sso_last_error = f"Moodle unreachable: {e}"
-        return None
-
-    # ── 2. Fill credentials (NetIQ or Moodle login form) ──
-    r2 = _fill_and_post(r)
-    if not r2:
-        _sso_last_error += " | no form found"
-        return None
-    _sso_last_error += f" | 2.creds→{r2.url[:60]}"
-
-    # ── 3. Follow SAML relay chain ──
-    r2 = _follow_relays(r2)
-
-    # ── 4. Trigger Panopto auth from now-logged-in Moodle session ──
-    if not any(c.name == ".ASPXAUTH" for c in s.cookies):
-        _sso_last_error += " | 3.panopto"
+    def _panopto_force_auth(auth_cas):
+        """GET Panopto Login.aspx and submit ViewState to trigger provider redirect."""
         try:
-            r3 = s.get(f"{PANOPTO_BASE}/Panopto/Pages/Auth/Login.aspx",
-                       params={"authCAS": "Moodle2025"}, allow_redirects=True, timeout=20)
-            _sso_last_error += f"→{r3.url[:60]}"
-            # If Panopto returned its own login page, submit forceStateChanged
-            if "panopto" in r3.url.lower():
-                soup3 = BeautifulSoup(r3.text, "html.parser")
-                form3 = soup3.find("form")
-                if form3:
-                    action3 = form3.get("action", r3.url)
-                    if not action3.startswith("http"):
-                        action3 = urljoin(r3.url, action3)
-                    data3 = {inp["name"]: inp.get("value", "")
-                             for inp in form3.find_all("input") if inp.get("name")}
-                    data3["ctl00$PageContentPlaceholder$loginControl$forceStateChanged"] = "Moodle2025"
-                    r4 = s.post(action3, data=data3, allow_redirects=True, timeout=20)
-                    _sso_last_error += f" | force→{r4.url[:50]}"
-                    _follow_relays(r4)
+            r = s.get(f"{PANOPTO_BASE}/Panopto/Pages/Auth/Login.aspx",
+                      params={"authCAS": auth_cas}, allow_redirects=True, timeout=20)
+            _sso_last_error_parts.append(f"{auth_cas}→{r.url[:60]}")
+            if any(c.name == ".ASPXAUTH" for c in s.cookies):
+                return True
+            soup = BeautifulSoup(r.text, "html.parser")
+            form = soup.find("form")
+            if not form:
+                js_url = _extract_js_url(r.text, r.url)
+                if js_url:
+                    r = s.get(js_url, allow_redirects=True, timeout=20)
+                    _sso_last_error_parts.append(f"js→{r.url[:50]}")
+                    soup = BeautifulSoup(r.text, "html.parser")
+                    form = soup.find("form")
+            if form:
+                if form.find("input", {"type": "password"}):
+                    r2 = _fill_and_post(r)
+                    if r2:
+                        _follow_relays(r2)
+                else:
+                    # ViewState / login-chooser form — set forceStateChanged and POST
+                    action = form.get("action") or r.url
+                    if not action.startswith("http"):
+                        action = urljoin(r.url, action)
+                    data = {i["name"]: i.get("value", "")
+                            for i in form.find_all("input") if i.get("name")}
+                    for k in list(data.keys()):
+                        if "forceState" in k or "loginControl" in k:
+                            data[k] = auth_cas
+                    r2 = s.post(action, data=data, allow_redirects=True, timeout=20)
+                    _sso_last_error_parts.append(f"force→{r2.url[:50]}")
+                    _follow_relays(r2)
         except Exception as e:
-            _sso_last_error += f" err:{e}"
+            _sso_last_error_parts.append(f"err:{e}")
+        return any(c.name == ".ASPXAUTH" for c in s.cookies)
+
+    _sso_last_error_parts = []
+
+    # ── STRATEGY A: Panopto-first (most direct path) ─────────────────────────
+    # Panopto Login.aspx with authCAS → ViewState form → POST → Moodle SAML →
+    # NetIQ HTML form → creds → NetIQ → Moodle → Panopto (.ASPXAUTH set)
+    _sso_last_error_parts.append("A.panopto")
+    for auth_cas in ("Moodle2025", "MOODLE", "Moodle"):
+        if _panopto_force_auth(auth_cas):
+            break
+        if any(c.name == ".ASPXAUTH" for c in s.cookies):
+            break
+
+    # ── STRATEGY B: Moodle-first with JS redirect parsing ────────────────────
+    # Moodle /login/index.php → (JS redirect or form) → NetIQ → creds →
+    # SAML chain → Moodle session → Panopto Login.aspx → .ASPXAUTH
+    if not any(c.name == ".ASPXAUTH" for c in s.cookies):
+        _sso_last_error_parts.append("B.moodle")
+        try:
+            r = s.get(f"{moodle_base}/login/index.php", allow_redirects=True, timeout=20)
+            _sso_last_error_parts.append(f"→{r.url[:60]}")
+
+            # Try HTML form directly
+            r2 = _fill_and_post(r)
+            if r2:
+                _sso_last_error_parts.append(f"form→{r2.url[:50]}")
+                _follow_relays(r2)
+            else:
+                # Parse JS redirect to find the real login page (e.g. nidp.tau.ac.il)
+                js_url = _extract_js_url(r.text, r.url)
+                if js_url:
+                    _sso_last_error_parts.append(f"jsredir→{js_url[:60]}")
+                    r3 = s.get(js_url, allow_redirects=True, timeout=20)
+                    _sso_last_error_parts.append(f"→{r3.url[:50]}")
+                    r4 = _fill_and_post(r3)
+                    if r4:
+                        _sso_last_error_parts.append(f"form→{r4.url[:50]}")
+                        _follow_relays(r4)
+                    else:
+                        # Try following relay chain from wherever we landed
+                        _follow_relays(r3)
+
+            # If we have Moodle session but not Panopto, trigger Panopto SSO
+            if not any(c.name == ".ASPXAUTH" for c in s.cookies):
+                for auth_cas in ("Moodle2025", "MOODLE", "Moodle"):
+                    if _panopto_force_auth(auth_cas):
+                        break
+        except Exception as e:
+            _sso_last_error_parts.append(f"moodle_err:{e}")
+
+    # ── STRATEGY C: Moodle token.php (diagnostic — shows if password works) ──
+    if not any(c.name == ".ASPXAUTH" for c in s.cookies):
+        _sso_last_error_parts.append("C.token_api")
+        try:
+            tr = s.post(f"{moodle_base}/login/token.php", data={
+                "username": username, "password": password, "service": "moodle_mobile_app"
+            }, allow_redirects=True, timeout=15)
+            _sso_last_error_parts.append(f"status={tr.status_code} body={tr.text[:120]}")
+        except Exception as e:
+            _sso_last_error_parts.append(f"err:{e}")
+
+    _sso_last_error = " | ".join(_sso_last_error_parts)
 
     if any(c.name == ".ASPXAUTH" for c in s.cookies):
         _sso_last_error = "SSO SUCCESS"
         return s
 
     moodle_cookies = [c.name for c in s.cookies
-                      if any(d in c.domain for d in ("tau.ac.il", "panopto"))]
-    _sso_last_error += f" | FAILED. cookies={moodle_cookies}"
+                      if any(d in (c.domain or "") for d in ("tau.ac.il", "panopto"))]
+    _sso_last_error += f" | FAILED cookies={moodle_cookies}"
     return None
 
 
@@ -620,11 +704,13 @@ def set_cookie():
 
 @app.route("/debug")
 def debug():
-    """Fast auth check — tests WebMethod with Referer header."""
+    """Auth diagnostics — shows SSO trace, cookies, WebMethod result, and Moodle page source."""
+    import html as html_mod
     out = {}
     try:
+        reset_session()  # always try a fresh SSO attempt on debug page
         s = get_session()
-        csrf = unquote(s.cookies.get("csrfToken", ""))  # decode %2f → /
+        csrf = unquote(s.cookies.get("csrfToken", ""))
         list_url = f"{PANOPTO_BASE}/Panopto/Pages/Sessions/List.aspx"
         hdrs = {
             "X-CSRF-Token": csrf,
@@ -637,14 +723,17 @@ def debug():
         out["cookies"] = list(s.cookies.keys())
         out["has_aspxauth"] = ".ASPXAUTH" in [c.name for c in s.cookies]
 
-        # Show Login.aspx HTML so we can see what's on the page
+        # Moodle login page source (fresh session, no cookies) — reveals JS redirect target
+        moodle_base = os.environ.get("MOODLE_URL", "https://moodle.tau.ac.il").rstrip("/")
         try:
-            rl = s.get(f"{PANOPTO_BASE}/Panopto/Pages/Auth/Login.aspx",
-                       params={"authCAS": "Moodle2025"}, allow_redirects=True, timeout=10)
-            out["login_page_url"] = rl.url[:100]
-            out["login_page_html"] = rl.text[:800]
+            sf = req.Session()
+            sf.headers["User-Agent"] = UA
+            rm = sf.get(f"{moodle_base}/login/index.php", allow_redirects=True, timeout=10)
+            out["moodle_login_url"] = rm.url[:120]
+            # Show first 600 chars of HTML so we can see JS redirects / forms
+            out["moodle_login_html"] = rm.text[:600]
         except Exception as ex:
-            out["login_page_html"] = f"ERR: {ex}"
+            out["moodle_login_html"] = f"ERR: {ex}"
 
         # Test WebMethod with decoded CSRF token
         try:
@@ -652,17 +741,18 @@ def debug():
                        "maxResults": 5, "page": 0, "startDate": None, "endDate": None,
                        "folderID": None, "bookmarked": False, "sessionListScope": 2}}
             rv = s.post(f"{list_url}/GetSessions", json=payload, headers=hdrs, timeout=10)
-            out["webmethod"] = f"HTTP {rv.status_code} | {rv.text[:500]}"
+            out["webmethod"] = f"HTTP {rv.status_code} | {rv.text[:400]}"
         except Exception as ex:
             out["webmethod"] = f"ERR: {ex}"
 
-        lines = "\n\n".join(f"{k}:\n  {v}" for k, v in out.items())
+        lines = "\n\n".join(f"{k}:\n  {html_mod.escape(str(v))}" for k, v in out.items())
         body = f"""
         <h1>Debug</h1>
         <div class="card"><pre style="white-space:pre-wrap;font-size:0.7rem;color:#94a3b8">{lines}</pre></div>
-        <a href="/" class="btn btn-primary">Back</a>"""
+        <a href="/lectures" class="btn btn-primary">Lectures</a>
+        &nbsp;<a href="/set-cookie" class="btn btn-sm" style="color:#94a3b8">Paste Cookies</a>"""
     except Exception as e:
-        body = f'<h1>Debug Error</h1><div class="alert alert-err">{e}</div>'
+        body = f'<h1>Debug Error</h1><div class="alert alert-err">{html.escape(str(e))}</div>'
     return PAGE.format(body=body)
 
 
