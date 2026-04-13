@@ -7,7 +7,6 @@ import math
 from datetime import datetime
 from flask import Flask, request, session, Response, send_file, redirect, url_for
 import requests as req
-from bs4 import BeautifulSoup
 from groq import Groq
 
 app = Flask(__name__)
@@ -17,117 +16,36 @@ PANOPTO_BASE = "https://tau.cloud.panopto.eu"
 SINCE_DATE = "2026-03-01T00:00:00.000Z"
 NOTES_DIR = tempfile.gettempdir()
 
-# Discovered API base path (set after first successful API call)
-_api_base = None
-
 # ---------------------------------------------------------------------------
-# Auth helpers — uses Playwright headless browser for JS-heavy SSO
+# Auth — uses cookies pasted manually from Safari (PANOPTO_COOKIE env var)
 # ---------------------------------------------------------------------------
 
 def _build_panopto_session():
-    from playwright.sync_api import sync_playwright
-
-    moodle_url = os.environ["MOODLE_URL"].rstrip("/")
-    username = os.environ["MOODLE_USERNAME"]
-    id_number = os.environ.get("MOODLE_ID", "")
-    password = os.environ["MOODLE_PASSWORD"]
-
-    with sync_playwright() as p:
-        browser = p.chromium.launch(
-            headless=True,
-            args=["--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu"],
-        )
-        context = browser.new_context()
-
-        # Intercept API calls to discover correct API path
-        discovered_api = []
-        def on_request(req_obj):
-            url = req_obj.url
-            if "panopto" in url and "/api/" in url:
-                discovered_api.append(url)
-        context.on("request", on_request)
-
-        page = context.new_page()
-
-        # 1. Navigate to Moodle — follows redirect to nidp.tau.ac.il SSO
-        page.goto(f"{moodle_url}/login/index.php", wait_until="domcontentloaded", timeout=30000)
-        page.wait_for_load_state("networkidle", timeout=15000)
-
-        # 2. Fill login form (works for nidp.tau.ac.il 3-field form)
-        page.wait_for_selector("input", timeout=10000)
-        inputs = page.query_selector_all("input:not([type='hidden']):not([type='submit'])")
-        for inp in inputs:
-            itype = (inp.get_attribute("type") or "text").lower()
-            placeholder = inp.get_attribute("placeholder") or ""
-            name = (inp.get_attribute("name") or "").lower()
-            if itype == "password":
-                inp.fill(password)
-            elif any(k in placeholder for k in ("משתמש", "user", "User", "username")) \
-                    or any(k in name for k in ("user", "login")):
-                inp.fill(username)
-            elif any(k in placeholder for k in ("זהות", "identity", "id", "ID")) \
-                    or any(k in name for k in ("id", "identity")):
-                inp.fill(id_number)
-
-        # Click submit
-        page.click("button[type='submit'], input[type='submit']")
-        page.wait_for_load_state("networkidle", timeout=20000)
-
-        # 3. Navigate to Panopto via Moodle SSO
-        for cas in ("MOODLE", "Moodle", "LTI"):
-            try:
-                page.goto(
-                    f"{PANOPTO_BASE}/Panopto/Pages/Auth/Login.aspx?authCAS={cas}",
-                    wait_until="networkidle", timeout=20000,
-                )
-                if "panopto" in page.url:
-                    break
-            except Exception:
-                continue
-
-        # 4. Visit Shared With Me page to trigger API calls and discover endpoints
-        try:
-            page.goto(
-                f"{PANOPTO_BASE}/Panopto/Pages/Sessions/List.aspx#isSharedWithMe=true",
-                wait_until="networkidle", timeout=20000,
-            )
-        except Exception:
-            pass
-
-        # 5. Extract cookies for the Panopto domain
-        all_cookies = context.cookies()
-        browser.close()
-
-    # Store discovered API path
-    global _api_base
-    for url in discovered_api:
-        m = re.search(r"(https?://[^/]+/Panopto/api/[^/]+)/", url)
-        if m:
-            _api_base = m.group(1)
-            break
-    if not _api_base:
-        _api_base = f"{PANOPTO_BASE}/Panopto/api/v1"
-
-    # Build requests.Session with extracted cookies
+    """Build a requests.Session using cookies copied from Safari."""
+    cookie_str = os.environ.get("PANOPTO_COOKIE", "")
     s = req.Session()
-    s.headers["User-Agent"] = "Mozilla/5.0"
-    for c in all_cookies:
-        if "panopto" in c.get("domain", ""):
-            s.cookies.set(c["name"], c["value"], domain=c["domain"])
+    s.headers["User-Agent"] = (
+        "Mozilla/5.0 (iPad; CPU OS 17_0 like Mac OS X) "
+        "AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1"
+    )
+    for part in cookie_str.split(";"):
+        part = part.strip()
+        if "=" in part:
+            name, _, value = part.partition("=")
+            s.cookies.set(name.strip(), value.strip(), domain="tau.cloud.panopto.eu")
     return s
 
 
 def get_session():
-    """Return a cached panopto requests.Session stored in app context."""
-    if not hasattr(app, "_panopto_session"):
-        app._panopto_session = None
-    if app._panopto_session is None:
+    if not hasattr(app, "_panopto_session") or app._panopto_session is None:
         app._panopto_session = _build_panopto_session()
     return app._panopto_session
 
 
 def reset_session():
     app._panopto_session = None
+
+
     global _api_base
     _api_base = None
 
@@ -428,65 +346,49 @@ PAGE = """<!DOCTYPE html>
 
 @app.route("/")
 def index():
-    if not all(k in os.environ for k in ("MOODLE_URL", "MOODLE_USERNAME", "MOODLE_PASSWORD", "MOODLE_ID", "GROQ_API_KEY")):
+    if not os.environ.get("PANOPTO_COOKIE"):
         body = """
         <h1>Lecture Notes</h1>
-        <p class="sub">Set up your environment variables to get started.</p>
-        <div class="alert alert-err">
-          Missing env vars. Add these in your Railway dashboard:<br><br>
-          <code>MOODLE_URL</code> · <code>MOODLE_USERNAME</code> · <code>MOODLE_ID</code> · <code>MOODLE_PASSWORD</code> · <code>GROQ_API_KEY</code> · <code>SECRET_KEY</code>
+        <p class="sub">One-time setup: get your Panopto session cookie from Safari.</p>
+        <div class="alert">
+          <strong>Step 1</strong> — Open <code>tau.cloud.panopto.eu</code> in Safari and log in normally.<br><br>
+          <strong>Step 2</strong> — Bookmark any page (tap the share button &#x2191; → Add Bookmark).<br><br>
+          <strong>Step 3</strong> — Open Bookmarks, find that bookmark, tap Edit, and replace its URL with exactly:<br>
+          <code style="word-break:break-all">javascript:prompt('Copy all of this:',document.cookie)</code><br><br>
+          <strong>Step 4</strong> — Go back to the Panopto page (still logged in), then open Bookmarks and tap that bookmark.<br><br>
+          <strong>Step 5</strong> — A dialog shows your cookies. Select all, copy.<br><br>
+          <strong>Step 6</strong> — In Railway → Variables, add <code>PANOPTO_COOKIE</code> and paste.<br><br>
+          Railway will redeploy automatically — then come back here.
+        </div>
+        <div class="alert" style="border-color:#6366f1;color:#a5b4fc;margin-top:12px">
+          Also make sure <code>GROQ_API_KEY</code> and <code>SECRET_KEY</code> are set in Railway Variables.
         </div>"""
+        return PAGE.format(body=body)
+    if not os.environ.get("GROQ_API_KEY"):
+        body = '<h1>Lecture Notes</h1><div class="alert alert-err">Missing <code>GROQ_API_KEY</code> — add it in Railway Variables.</div>'
         return PAGE.format(body=body)
     return redirect(url_for("lectures"))
 
 
 @app.route("/debug")
 def debug():
-    """Diagnostic page — shows login form fields and Panopto API responses."""
+    """Check cookie auth and API connectivity."""
     out = {}
     try:
-        moodle_url = os.environ["MOODLE_URL"].rstrip("/")
-        s = req.Session()
-        s.headers["User-Agent"] = "Mozilla/5.0"
-
-        # Step 1: fetch Moodle login page and follow redirects to SSO
-        r = s.get(f"{moodle_url}/login/index.php", timeout=20, allow_redirects=True)
-        out["login_final_url"] = r.url
-        soup = BeautifulSoup(r.text, "html.parser")
-        form = soup.find("form")
-        if form:
-            out["form_action"] = form.get("action", "")
-            fields = {}
-            for inp in form.find_all("input"):
-                name = inp.get("name", "")
-                itype = inp.get("type", "text")
-                placeholder = inp.get("placeholder", "")
-                if name:
-                    fields[name] = {"type": itype, "placeholder": placeholder}
-            out["form_fields"] = fields
-        else:
-            out["form_fields"] = "NO FORM FOUND"
-            out["page_snippet"] = r.text[:500]
-
-        # Step 2: try Panopto API versions
-        ps = get_session()
+        s = get_session()
+        out["cookie_set"] = bool(os.environ.get("PANOPTO_COOKIE"))
+        out["cookies_in_session"] = list(s.cookies.keys())
         for ver in ["v1", "4.2", "4.6"]:
-            rv = ps.get(f"{PANOPTO_BASE}/Panopto/api/{ver}/sessions",
-                        params={"pagination[maxResults]": 3}, timeout=15)
-            out[f"api_{ver}"] = f"{rv.status_code}: {rv.text[:200]}"
-
-        # Step 3: try the older Panopto REST path
-        rv2 = ps.get(f"{PANOPTO_BASE}/Panopto/Services/Data.svc/GetSessionsList",
-                     timeout=15)
-        out["old_api"] = f"{rv2.status_code}: {rv2.text[:200]}"
-
-        lines = "\n".join(f"{k}: {v}" for k, v in out.items())
+            rv = s.get(f"{PANOPTO_BASE}/Panopto/api/{ver}/sessions",
+                       params={"pagination[maxResults]": 3}, timeout=15)
+            out[f"api_{ver}"] = f"{rv.status_code}: {rv.text[:300]}"
+        lines = "\n\n".join(f"{k}:\n  {v}" for k, v in out.items())
         body = f"""
         <h1>Debug</h1>
         <div class="card"><pre style="white-space:pre-wrap;font-size:0.72rem;color:#94a3b8">{lines}</pre></div>
         <a href="/" class="btn btn-primary">Back</a>"""
     except Exception as e:
-        body = f'<h1>Debug Error</h1><div class="alert alert-err">{e}</div><pre>{out}</pre>'
+        body = f'<h1>Debug Error</h1><div class="alert alert-err">{e}</div>'
     return PAGE.format(body=body)
 
 
