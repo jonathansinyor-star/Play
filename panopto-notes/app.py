@@ -18,20 +18,138 @@ SINCE_DATE = "2026-03-01T00:00:00.000Z"
 NOTES_DIR = tempfile.gettempdir()
 
 # ---------------------------------------------------------------------------
-# Auth — uses cookies pasted manually from Safari (PANOPTO_COOKIE env var)
+# Auth
 # ---------------------------------------------------------------------------
 
-_runtime_cookie = ""  # set via /set-cookie, overrides PANOPTO_COOKIE env var
+_runtime_cookie = ""  # set via /set-cookie page
+_sso_last_error = ""  # last SSO failure reason (shown in debug)
+
+UA = ("Mozilla/5.0 (iPad; CPU OS 17_0 like Mac OS X) "
+      "AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1")
+
+
+def _try_sso_login():
+    """Attempt Panopto → Moodle → NetIQ SSO. Returns requests.Session or None."""
+    from bs4 import BeautifulSoup
+    from urllib.parse import urljoin
+
+    global _sso_last_error
+    username = os.environ.get("MOODLE_USERNAME", "")
+    moodle_id = os.environ.get("MOODLE_ID", "")
+    password = os.environ.get("MOODLE_PASSWORD", "")
+    if not username or not password:
+        _sso_last_error = "MOODLE_USERNAME or MOODLE_PASSWORD not set"
+        return None
+
+    s = req.Session()
+    s.headers["User-Agent"] = UA
+
+    # 1. Kick off SSO — Panopto redirects → Moodle → NetIQ login form
+    try:
+        r = s.get(f"{PANOPTO_BASE}/Panopto/Pages/Auth/Login.aspx",
+                  params={"authCAS": "MOODLE"}, allow_redirects=True, timeout=20)
+    except Exception as e:
+        _sso_last_error = f"SSO start error: {e}"
+        return None
+
+    _sso_last_error = f"landed at: {r.url[:80]}"
+
+    # 2. Find and fill the login form
+    soup = BeautifulSoup(r.text, "html.parser")
+    form = soup.find("form")
+    if not form:
+        _sso_last_error = f"No form at {r.url[:80]}. Snippet: {r.text[:150]}"
+        return None
+
+    action = form.get("action", r.url)
+    if not action.startswith("http"):
+        action = urljoin(r.url, action)
+
+    data = {inp["name"]: inp.get("value", "")
+            for inp in form.find_all("input") if inp.get("name")}
+
+    text_fields = [inp["name"] for inp in form.find_all("input")
+                   if inp.get("name") and inp.get("type", "text").lower() in ("text", "email", "")]
+    pass_fields = [inp["name"] for inp in form.find_all("input")
+                   if inp.get("name") and inp.get("type", "").lower() == "password"]
+
+    # Fill username (first text field or known names)
+    filled = False
+    for fname in ["Ecom_User_ID", "username", "loginname", "j_username", "user"]:
+        if fname in data:
+            data[fname] = username
+            filled = True
+            break
+    if not filled and text_fields:
+        data[text_fields[0]] = username
+
+    # Fill student ID into second text field if present
+    if moodle_id and len(text_fields) >= 2:
+        data[text_fields[1]] = moodle_id
+
+    # Fill password
+    filled = False
+    for fname in ["Ecom_Password", "password", "passwd", "j_password"]:
+        if fname in data:
+            data[fname] = password
+            filled = True
+            break
+    if not filled and pass_fields:
+        data[pass_fields[0]] = password
+
+    _sso_last_error += f" | form→{action[:60]} fields={list(data.keys())}"
+
+    try:
+        r2 = s.post(action, data=data, allow_redirects=True, timeout=30)
+    except Exception as e:
+        _sso_last_error += f" | submit error: {e}"
+        return None
+
+    _sso_last_error += f" | after submit: {r2.url[:60]}"
+
+    # 3. Follow any SAML/CAS relay forms (hidden auto-submit)
+    for _ in range(4):
+        if any(c.name == ".ASPXAUTH" for c in s.cookies):
+            break
+        soup2 = BeautifulSoup(r2.text, "html.parser")
+        relay = soup2.find("form")
+        if not relay:
+            break
+        ra = relay.get("action", "")
+        if not ra:
+            break
+        if not ra.startswith("http"):
+            ra = urljoin(r2.url, ra)
+        rd = {inp["name"]: inp.get("value", "")
+              for inp in relay.find_all("input") if inp.get("name")}
+        if not any(k in rd for k in ("SAMLResponse", "lt", "ticket", "RelayState", "execution")):
+            break
+        try:
+            r2 = s.post(ra, data=rd, allow_redirects=True, timeout=20)
+            _sso_last_error += f" | relay→{r2.url[:60]}"
+        except Exception:
+            break
+
+    if any(c.name == ".ASPXAUTH" for c in s.cookies):
+        _sso_last_error = "SSO SUCCESS"
+        return s
+
+    _sso_last_error += f" | FAILED — cookies: {[c.name for c in s.cookies]}"
+    return None
 
 
 def _build_panopto_session():
-    """Build a requests.Session using cookies (runtime or env var)."""
+    """Try SSO first, fall back to pasted cookies."""
+    # Auto-login via Moodle SSO
+    if os.environ.get("MOODLE_USERNAME") and os.environ.get("MOODLE_PASSWORD"):
+        s = _try_sso_login()
+        if s:
+            return s
+
+    # Fall back to manually pasted cookies
     cookie_str = _runtime_cookie or os.environ.get("PANOPTO_COOKIE", "")
     s = req.Session()
-    s.headers["User-Agent"] = (
-        "Mozilla/5.0 (iPad; CPU OS 17_0 like Mac OS X) "
-        "AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1"
-    )
+    s.headers["User-Agent"] = UA
     for part in cookie_str.split(";"):
         part = part.strip()
         if "=" in part:
@@ -47,7 +165,6 @@ def get_session():
 
 
 def reset_session():
-    global _runtime_cookie
     app._panopto_session = None
 
 
@@ -486,6 +603,7 @@ def debug():
             "Referer": list_url,
             "Origin": PANOPTO_BASE,
         }
+        out["sso_status"] = _sso_last_error
         out["cookies"] = list(s.cookies.keys())
         out["has_aspxauth"] = ".ASPXAUTH" in [c.name for c in s.cookies]
         out["csrf_decoded_len"] = len(csrf)
