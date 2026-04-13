@@ -21,9 +21,12 @@ NOTES_DIR = tempfile.gettempdir()
 # Auth — uses cookies pasted manually from Safari (PANOPTO_COOKIE env var)
 # ---------------------------------------------------------------------------
 
+_runtime_cookie = ""  # set via /set-cookie, overrides PANOPTO_COOKIE env var
+
+
 def _build_panopto_session():
-    """Build a requests.Session using cookies copied from Safari."""
-    cookie_str = os.environ.get("PANOPTO_COOKIE", "")
+    """Build a requests.Session using cookies (runtime or env var)."""
+    cookie_str = _runtime_cookie or os.environ.get("PANOPTO_COOKIE", "")
     s = req.Session()
     s.headers["User-Agent"] = (
         "Mozilla/5.0 (iPad; CPU OS 17_0 like Mac OS X) "
@@ -44,11 +47,8 @@ def get_session():
 
 
 def reset_session():
+    global _runtime_cookie
     app._panopto_session = None
-
-
-    global _api_base
-    _api_base = None
 
 
 # ---------------------------------------------------------------------------
@@ -444,6 +444,31 @@ def index():
         body = '<h1>Lecture Notes</h1><div class="alert alert-err">Missing <code>GROQ_API_KEY</code> — add it in Railway Variables.</div>'
         return PAGE.format(body=body)
     return redirect(url_for("lectures"))
+
+
+@app.route("/set-cookie", methods=["GET", "POST"])
+def set_cookie():
+    global _runtime_cookie
+    if request.method == "POST":
+        _runtime_cookie = request.form.get("cookies", "").strip()
+        reset_session()
+        return redirect(url_for("lectures"))
+    body = """
+    <h1>Update Cookies</h1>
+    <p class="sub">Paste your Panopto cookies from Chrome DevTools here.<br>
+    No need to touch Railway — just paste and tap Save.</p>
+    <div class="alert" style="border-color:#6366f1;color:#a5b4fc">
+      In Chrome: log into tau.cloud.panopto.eu → right-click → Inspect →
+      Application tab → Cookies → tau.cloud.panopto.eu →
+      copy each cookie's Name and Value.
+    </div>
+    <form method="post">
+      <label>Paste all cookies as: Name=Value; Name=Value; ...</label>
+      <textarea name="cookies" rows="6" style="width:100%;padding:10px;border-radius:8px;background:#0f172a;border:1px solid #334155;color:#e2e8f0;font-size:0.8rem;margin-bottom:12px;font-family:monospace"></textarea>
+      <button type="submit" class="btn btn-primary btn-full">Save &amp; Connect</button>
+    </form>
+    <br><a href="/" class="btn btn-sm" style="color:#64748b">Cancel</a>"""
+    return PAGE.format(body=body)
 
 
 @app.route("/debug")
