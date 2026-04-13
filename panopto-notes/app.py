@@ -142,95 +142,40 @@ def _try_sso_login():
         return r
 
     def _panopto_force_auth(auth_cas):
-        """GET Panopto Login.aspx and submit ViewState to trigger provider redirect."""
+        """Trigger Panopto SSO by adding instance= to Login.aspx URL.
+
+        The browser onclick handler does:
+            window.location.search += '&instance=Moodle2025'; return false;
+        i.e. it navigates to Login.aspx?authCAS=X&instance=X and the server
+        then does a Response.Redirect to the provider's SAML/auth endpoint.
+        No form POST involved — the doPostBack href is cancelled by return false.
+        """
         try:
-            # Tell Panopto which provider to use via the UserSettings cookie — this
-            # sometimes causes Panopto to skip the chooser and redirect directly.
             s.cookies.set("UserSettings", f"LastLoginMembershipProvider={auth_cas}",
                           domain="tau.cloud.panopto.eu")
+            # Replicate the onclick: GET with instance= added to query string
             r = s.get(f"{PANOPTO_BASE}/Panopto/Pages/Auth/Login.aspx",
-                      params={"authCAS": auth_cas}, allow_redirects=True, timeout=20)
-            _sso_last_error_parts.append(f"{auth_cas}→{r.url[:60]}")
-            if any(c.name == ".ASPXAUTH" for c in s.cookies):
-                return True
+                      params={"authCAS": auth_cas, "instance": auth_cas},
+                      allow_redirects=False, timeout=20)
+            loc = r.headers.get("Location", "")
+            _sso_last_error_parts.append(f"{auth_cas}&inst→{r.status_code} loc={loc[:80]}")
 
-            # If we already left Panopto (redirect happened), follow the chain
-            if PANOPTO_BASE not in r.url:
-                _follow_relays(r)
+            if r.status_code in (301, 302, 303, 307, 308) and loc:
+                if not loc.startswith("http"):
+                    loc = urljoin(PANOPTO_BASE, loc)
+                r2 = s.get(loc, allow_redirects=True, timeout=20)
+                _sso_last_error_parts.append(f"→{r2.url[:70]}")
                 if any(c.name == ".ASPXAUTH" for c in s.cookies):
                     return True
-
-            soup = BeautifulSoup(r.text, "html.parser")
-            form = soup.find("form")
-            if not form:
-                js_url = _extract_js_url(r.text, r.url)
-                if js_url:
-                    r = s.get(js_url, allow_redirects=True, timeout=20)
-                    _sso_last_error_parts.append(f"js→{r.url[:50]}")
-                    soup = BeautifulSoup(r.text, "html.parser")
-                    form = soup.find("form")
-            if form:
-                if form.find("input", {"type": "password"}):
-                    r2 = _fill_and_post(r)
-                    if r2:
-                        _follow_relays(r2)
-                else:
-                    # ViewState / login-chooser form.
-                    # ASP.NET WebForms button clicks use __EVENTTARGET/__EVENTARGUMENT,
-                    # NOT custom hidden fields. The browser calls __doPostBack(id, arg).
-                    # Find those calls in the page HTML to get the real control IDs.
-                    action = form.get("action") or r.url
-                    if not action.startswith("http"):
-                        action = urljoin(r.url, action)
-                    base_data = {i["name"]: i.get("value", "")
-                                 for i in form.find_all("input") if i.get("name")}
-
-                    # Extract __doPostBack targets — search BS4-decoded href/onclick attrs
-                    # (raw HTML uses &#39; entities which fool regex on r.text)
-                    dopost = []
-                    for a_tag in soup.find_all("a"):
-                        for attr in ("href", "onclick"):
-                            val = a_tag.get(attr, "")
-                            m = re.search(r"__doPostBack\('([^']+)','([^']*)'\)", val)
-                            if m:
-                                dopost.append((m.group(1), m.group(2)))
-
-                    # Fallback: raw HTML with &#39; entity decoding
-                    if not dopost:
-                        decoded = r.text.replace("&#39;", "'")
-                        dopost = re.findall(r"__doPostBack\('([^']+)','([^']*)'\)", decoded)
-
-                    # Hardcoded fallback based on debug-observed control ID prefix
-                    if not dopost:
-                        dopost = [
-                            ("ctl00$PageContentPlaceholder$loginControl$externalLogin", auth_cas),
-                            ("ctl00$PageContentPlaceholder$loginControl$externalLogin$ctl00$lnkLogin", auth_cas),
-                        ]
-                    _sso_last_error_parts.append(f"dopost={[t for t,_ in dopost[:3]]}")
-
-                    def _try_post(extra_fields):
-                        d = dict(base_data)
-                        d.update(extra_fields)
-                        rp = s.post(action, data=d, allow_redirects=False, timeout=20)
-                        loc = rp.headers.get("Location", "")
-                        _sso_last_error_parts.append(
-                            f"POST→{rp.status_code} loc={loc[:70]}")
-                        if rp.status_code in (301, 302, 303, 307, 308) and loc:
-                            if not loc.startswith("http"):
-                                loc = urljoin(PANOPTO_BASE, loc)
-                            r2 = s.get(loc, allow_redirects=True, timeout=20)
-                            _sso_last_error_parts.append(f"→{r2.url[:70]}")
-                            _follow_relays(r2)
-                            return True
-                        elif rp.status_code == 200:
-                            # Panopto sometimes does a JS redirect in the 200 body
-                            _follow_relays(rp)
-                        return False
-
-                    for target, arg in dopost:
-                        _try_post({"__EVENTTARGET": target, "__EVENTARGUMENT": arg})
-                        if any(c.name == ".ASPXAUTH" for c in s.cookies):
-                            break
+                _follow_relays(r2)
+            elif r.status_code == 200:
+                # Server didn't redirect — follow anyway in case of JS redirect in body
+                r2 = s.get(f"{PANOPTO_BASE}/Panopto/Pages/Auth/Login.aspx",
+                           params={"authCAS": auth_cas, "instance": auth_cas},
+                           allow_redirects=True, timeout=20)
+                _sso_last_error_parts.append(f"200follow→{r2.url[:70]}")
+                if PANOPTO_BASE not in r2.url:
+                    _follow_relays(r2)
         except Exception as e:
             _sso_last_error_parts.append(f"err:{e}")
         return any(c.name == ".ASPXAUTH" for c in s.cookies)
@@ -843,11 +788,12 @@ def debug():
                                   if any(k in m.lower() for k in ('moodle', 'provider', 'authcas'))]
                 out["pan_json_auth"] = str(json_with_auth[:3])
 
-                # Also try GET with allow_redirects=False to see if there's an immediate redirect
-                r1b = sf.get(f"{PANOPTO_BASE}/Panopto/Pages/Auth/Login.aspx",
-                             params={"authCAS": "Moodle2025"}, allow_redirects=False, timeout=10)
-                out["pan_get_nodirect_status"] = r1b.status_code
-                out["pan_get_nodirect_location"] = r1b.headers.get("Location", "(none)")
+                # THE KEY TEST: GET with instance= (what the onclick JS does)
+                r_inst = sf.get(f"{PANOPTO_BASE}/Panopto/Pages/Auth/Login.aspx",
+                                params={"authCAS": "Moodle2025", "instance": "Moodle2025"},
+                                allow_redirects=False, timeout=10)
+                out["pan_instance_status"] = r_inst.status_code
+                out["pan_instance_location"] = r_inst.headers.get("Location", "(none — no redirect)")
             else:
                 out["pan_step1_form"] = "NO FORM FOUND"
                 out["pan_step1_js_url"] = str(_extract_js_url_debug(r1.text, r1.url))
