@@ -84,9 +84,28 @@ def _try_sso_login():
         with sync_playwright() as p:
             browser = p.chromium.launch(
                 headless=True,
-                args=["--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu"],
+                args=[
+                    "--no-sandbox",
+                    "--disable-dev-shm-usage",
+                    "--disable-gpu",
+                    "--disable-blink-features=AutomationControlled",
+                ],
             )
-            context = browser.new_context(user_agent=UA)
+            # Use a desktop Chrome UA — enterprise SSO (NetIQ/NIDP) often
+            # renders different forms for mobile UAs and may reject headless mobile
+            desktop_ua = (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/124.0.0.0 Safari/537.36"
+            )
+            context = browser.new_context(
+                user_agent=desktop_ua,
+                extra_http_headers={"Accept-Language": "en-US,en;q=0.9"},
+            )
+            # Mask navigator.webdriver so NIDP bot-detection doesn't flag us
+            context.add_init_script(
+                "Object.defineProperty(navigator,'webdriver',{get:()=>undefined});"
+            )
             page = context.new_page()
 
             # 1. Land on Panopto login page — this loads the SSO button
@@ -150,6 +169,12 @@ def _try_sso_login():
                 if not submitted:
                     page.locator("input[type='password']").first.press("Enter")
                 _sso_last_error += f" | btn_click={submitted}"
+                # Brief wait then record where we ended up (MFA? CAPTCHA? wrong creds?)
+                try:
+                    page.wait_for_load_state("networkidle", timeout=8000)
+                except Exception:
+                    pass
+                _sso_last_error += f" | post_submit_url={page.url[:90]}"
 
             # 5. Wait to land back on Panopto — SAML chain nidp→moodle→panopto
             #    can take 60-90s on TAU infrastructure
