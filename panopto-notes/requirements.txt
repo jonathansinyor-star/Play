@@ -2,4 +2,4 @@ flask
 gunicorn
 requests
 groq
-playwright
+playwright==1.49.0

@@ -574,6 +574,34 @@ PAGE = """<!DOCTYPE html>
 # Routes
 # ---------------------------------------------------------------------------
 
+@app.route("/health")
+def health():
+    """Instant status — no SSO triggered. Visit this to confirm code version."""
+    import html as _h
+    pw_cache = os.path.join(os.path.expanduser("~"), ".cache", "ms-playwright")
+    try:
+        browsers = os.listdir(pw_cache) if os.path.isdir(pw_cache) else []
+    except Exception:
+        browsers = []
+    status = {
+        "version": "2026-04-14-v5",
+        "session_ready": session_is_ready(),
+        "sso_last_error": _sso_last_error,
+        "pw_browsers": browsers,
+        "lock_held": _session_lock.locked(),
+        "env_username_set": bool(os.environ.get("MOODLE_USERNAME")),
+        "env_password_set": bool(os.environ.get("MOODLE_PASSWORD")),
+        "env_groq_set": bool(os.environ.get("GROQ_API_KEY")),
+    }
+    lines = "\n".join(f"{k}: {v}" for k, v in status.items())
+    body = f"""
+    <h1>Health</h1>
+    <div class="card"><pre style="white-space:pre-wrap;font-size:0.8rem;color:#94a3b8">{_h.escape(lines)}</pre></div>
+    <a href="/lectures" class="btn btn-primary" style="margin-top:12px">Go to Lectures</a>
+    &nbsp;<a href="/debug" class="btn btn-sm" style="color:#64748b">Debug</a>"""
+    return PAGE.format(body=body)
+
+
 @app.route("/")
 def index():
     has_auto_auth = (os.environ.get("MOODLE_USERNAME") and os.environ.get("MOODLE_PASSWORD"))
