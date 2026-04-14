@@ -13,6 +13,35 @@ from groq import Groq
 app = Flask(__name__)
 app.secret_key = os.environ.get("SECRET_KEY", "change-me-in-railway")
 
+# ---------------------------------------------------------------------------
+# Ensure Playwright Chromium is installed (build-time install may be skipped
+# by Railway's layer cache; this catches that case at first startup).
+# ---------------------------------------------------------------------------
+def _ensure_chromium():
+    pw_cache = os.path.join(os.path.expanduser("~"), ".cache", "ms-playwright")
+    already_installed = (
+        os.path.isdir(pw_cache)
+        and any("chromium" in d for d in os.listdir(pw_cache))
+    )
+    if already_installed:
+        return
+    try:
+        subprocess.run(
+            ["playwright", "install", "chromium", "--with-deps"],
+            timeout=180, capture_output=True,
+        )
+    except Exception:
+        # --with-deps may fail in restricted envs; try without
+        try:
+            subprocess.run(
+                ["playwright", "install", "chromium"],
+                timeout=180, capture_output=True,
+            )
+        except Exception:
+            pass
+
+_ensure_chromium()
+
 PANOPTO_BASE = "https://tau.cloud.panopto.eu"
 SINCE_DATE = "2026-03-01T00:00:00.000Z"
 NOTES_DIR = tempfile.gettempdir()
