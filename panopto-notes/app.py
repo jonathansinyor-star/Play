@@ -45,6 +45,9 @@ def _ensure_chromium():
 import threading as _threading
 _threading.Thread(target=_ensure_chromium, daemon=True).start()
 
+# Lock so only one SSO attempt runs at a time (warmup thread + request thread race)
+_session_lock = _threading.Lock()
+
 PANOPTO_BASE = "https://tau.cloud.panopto.eu"
 SINCE_DATE = "2026-03-01T00:00:00.000Z"
 NOTES_DIR = tempfile.gettempdir()
@@ -186,13 +189,20 @@ def _build_panopto_session():
 
 
 def get_session():
-    if not hasattr(app, "_panopto_session") or app._panopto_session is None:
-        app._panopto_session = _build_panopto_session()
+    with _session_lock:
+        if not hasattr(app, "_panopto_session") or app._panopto_session is None:
+            app._panopto_session = _build_panopto_session()
     return app._panopto_session
 
 
 def reset_session():
-    app._panopto_session = None
+    with _session_lock:
+        app._panopto_session = None
+
+
+def session_is_ready():
+    """True if a session is already cached (doesn't trigger SSO)."""
+    return hasattr(app, "_panopto_session") and app._panopto_session is not None
 
 
 # ---------------------------------------------------------------------------
@@ -624,7 +634,8 @@ def debug():
     import html as html_mod
     out = {}
     try:
-        reset_session()
+        if request.args.get("fresh"):
+            reset_session()
         s = get_session()
         csrf = unquote(s.cookies.get("csrfToken", ""))
         list_url = f"{PANOPTO_BASE}/Panopto/Pages/Sessions/List.aspx"
@@ -648,6 +659,7 @@ def debug():
         <h1>Debug</h1>
         <div class="card"><pre style="white-space:pre-wrap;font-size:0.75rem;color:#94a3b8">{lines}</pre></div>
         <a href="/lectures" class="btn btn-primary">Lectures</a>
+        &nbsp;<a href="/debug?fresh=1" class="btn btn-sm" style="color:#94a3b8">Re-auth</a>
         &nbsp;<a href="/set-cookie" class="btn btn-sm" style="color:#94a3b8">Paste Cookies</a>"""
     except Exception as e:
         body = f'<h1>Debug Error</h1><div class="alert alert-err">{html_mod.escape(str(e))}</div>'
@@ -657,6 +669,20 @@ def debug():
 @app.route("/lectures")
 def lectures():
     error = request.args.get("error")
+
+    # If SSO is still in progress (lock held by warmup thread), show a spinner
+    # instead of blocking the HTTP connection for 60+ seconds.
+    if not session_is_ready() and _session_lock.locked():
+        body = """
+        <h1>Lecture Notes</h1>
+        <p class="sub">Logging into Panopto via Moodle SSO&hellip;</p>
+        <div class="card">
+          <div><span class="spinner"></span> Connecting, please wait&hellip;</div>
+          <div class="meta" style="margin-top:8px">This takes about 30&ndash;60 seconds on first load.</div>
+        </div>
+        <meta http-equiv="refresh" content="6">"""
+        return PAGE.format(body=body)
+
     try:
         sessions = list_shared_sessions()
     except Exception as e:
@@ -841,6 +867,24 @@ def download(session_id):
         download_name=f"notes_{session_id[:8]}.md",
         mimetype="text/markdown",
     )
+
+
+def _startup_warmup():
+    """Pre-warm the Panopto session so the first user request is instant.
+
+    Waits 8 seconds for the app to fully start (and for _ensure_chromium to
+    kick off), then triggers SSO in the background. By the time a user opens
+    the app URL the session is usually already cached.
+    """
+    import time
+    time.sleep(8)
+    if os.environ.get("MOODLE_USERNAME") or os.environ.get("PANOPTO_COOKIE") or _runtime_cookie:
+        try:
+            get_session()
+        except Exception:
+            pass
+
+_threading.Thread(target=_startup_warmup, daemon=True).start()
 
 
 if __name__ == "__main__":
