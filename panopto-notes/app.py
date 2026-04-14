@@ -31,13 +31,13 @@ def _ensure_chromium():
     try:
         subprocess.run(
             ["playwright", "install", "chromium", "--with-deps"],
-            timeout=180, capture_output=True,
+            timeout=180,
         )
     except Exception:
         try:
             subprocess.run(
                 ["playwright", "install", "chromium"],
-                timeout=180, capture_output=True,
+                timeout=180,
             )
         except Exception:
             pass
