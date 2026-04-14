@@ -726,17 +726,36 @@ def debug():
         out["sso_status"] = _sso_last_error
         out["cookies"] = list(s.cookies.keys())
         out["has_aspxauth"] = ".ASPXAUTH" in [c.name for c in s.cookies]
+        # Warmup: visit List.aspx so Panopto issues a fresh csrfToken
         try:
-            payload = {"queryParameters": {"query": "", "sortColumn": 1, "sortAscending": False,
-                       "maxResults": 5, "page": 0, "startDate": None, "endDate": None,
-                       "folderID": None, "bookmarked": False, "sessionListScope": 2}}
-            rv = s.post(f"{list_url}/GetSessions", json=payload, timeout=10,
-                        headers={"X-CSRF-Token": csrf, "Accept": "application/json",
-                                 "Content-Type": "application/json; charset=UTF-8",
-                                 "Referer": list_url, "Origin": PANOPTO_BASE})
-            out["webmethod"] = f"HTTP {rv.status_code} | {rv.text[:400]}"
+            warmup = s.get(list_url, allow_redirects=True, timeout=15)
+            out["list_aspx"] = f"HTTP {warmup.status_code} url={warmup.url[:80]}"
         except Exception as ex:
-            out["webmethod"] = f"ERR: {ex}"
+            out["list_aspx"] = f"ERR: {ex}"
+        csrf = unquote(s.cookies.get("csrfToken", ""))
+
+        # WebMethod (scope 0 = all, scope 2 = shared with me)
+        for scope in (2, 0):
+            try:
+                payload = {"queryParameters": {"query": "", "sortColumn": 1,
+                           "sortAscending": False, "maxResults": 5, "page": 0,
+                           "startDate": None, "endDate": None, "folderID": None,
+                           "bookmarked": False, "sessionListScope": scope}}
+                rv = s.post(f"{list_url}/GetSessions", json=payload, timeout=15,
+                            headers={"X-CSRF-Token": csrf, "Accept": "application/json",
+                                     "Content-Type": "application/json; charset=UTF-8",
+                                     "Referer": list_url, "Origin": PANOPTO_BASE})
+                out[f"webmethod_scope{scope}"] = f"HTTP {rv.status_code} | {rv.text[:300]}"
+            except Exception as ex:
+                out[f"webmethod_scope{scope}"] = f"ERR: {ex}"
+
+        # REST API fallback
+        try:
+            ra = s.get(f"{PANOPTO_BASE}/Panopto/api/v1/sessions",
+                       params={"isSharedWithMe": "true", "maxResults": 5}, timeout=15)
+            out["rest_api"] = f"HTTP {ra.status_code} | {ra.text[:300]}"
+        except Exception as ex:
+            out["rest_api"] = f"ERR: {ex}"
 
         lines = "\n\n".join(f"{k}:\n  {html_mod.escape(str(v))}" for k, v in out.items())
         body = f"""
