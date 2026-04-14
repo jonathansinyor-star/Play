@@ -74,7 +74,7 @@ def _try_sso_login():
 
     global _sso_last_error
     username = os.environ.get("MOODLE_USERNAME", "")
-    tau_id   = os.environ.get("TAU_ID", "")
+    tau_id   = os.environ.get("MOODLE_ID", "")
     password = os.environ.get("MOODLE_PASSWORD", "")
 
     if not username or not password:
