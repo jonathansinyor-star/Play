@@ -271,44 +271,8 @@ def _parse_ms_date(date_str):
     return date_str
 
 
-def _webmethod_sessions(s, max_results=100):
-    """Call Panopto's internal GetSessions WebMethod (what the web app uses)."""
-    list_url = f"{PANOPTO_BASE}/Panopto/Pages/Sessions/List.aspx"
-    # Visit the page first — this causes Panopto to issue/refresh the csrfToken
-    # cookie so our subsequent POST has a valid token.
-    try:
-        s.get(list_url, allow_redirects=True, timeout=15)
-    except Exception:
-        pass
-    csrf = unquote(s.cookies.get("csrfToken", ""))
-    payload = {
-        "queryParameters": {
-            "query": "",
-            "sortColumn": 1,
-            "sortAscending": False,
-            "maxResults": max_results,
-            "page": 0,
-            "startDate": SINCE_DATE,
-            "endDate": None,
-            "folderID": None,
-            "bookmarked": False,
-            "sessionListScope": 2,  # 2 = Shared with me
-        }
-    }
-    r = s.post(
-        f"{list_url}/GetSessions",
-        json=payload,
-        headers={
-            "X-CSRF-Token": csrf,
-            "Accept": "application/json",
-            "Content-Type": "application/json; charset=UTF-8",
-            "Referer": list_url,
-            "Origin": PANOPTO_BASE,
-        },
-        timeout=30,
-    )
-    r.raise_for_status()
-    raw = r.json().get("d", {}).get("Results", [])
+def _parse_webmethod_results(raw):
+    """Normalise raw GetSessions result items into our standard dict."""
     results = []
     for item in raw:
         results.append({
@@ -322,43 +286,170 @@ def _webmethod_sessions(s, max_results=100):
     return results
 
 
+def _webmethod_headers(csrf, list_url):
+    return {
+        "X-CSRF-Token": csrf,
+        "Accept": "application/json",
+        "Content-Type": "application/json; charset=UTF-8",
+        "Referer": list_url,
+        "Origin": PANOPTO_BASE,
+    }
+
+
+def _webmethod_sessions(s, max_results=100):
+    """Call Panopto's internal GetSessions WebMethod.
+
+    TAU runs an older Panopto build. We try several payload shapes in order,
+    stopping at the first 200 response. The most common cause of HTTP 500 on
+    older installs is including fields that don't exist in that version
+    (e.g. sessionListScope was added later).
+    """
+    list_url = f"{PANOPTO_BASE}/Panopto/Pages/Sessions/List.aspx"
+    # Visit the page first to get a fresh csrfToken cookie
+    try:
+        s.get(list_url, allow_redirects=True, timeout=15)
+    except Exception:
+        pass
+    csrf = unquote(s.cookies.get("csrfToken", ""))
+    hdrs = _webmethod_headers(csrf, list_url)
+    endpoint = f"{list_url}/GetSessions"
+
+    # Payloads ordered from most-minimal to most-specific.
+    # Older Panopto (pre-5.x) doesn't have sessionListScope or bookmarked.
+    payloads = [
+        # 1. Bare minimum — just query + paging (widest compatibility)
+        {"queryParameters": {
+            "query": "", "maxResults": max_results, "page": 0,
+        }},
+        # 2. Add sort fields (still no scope)
+        {"queryParameters": {
+            "query": "", "sortColumn": 1, "sortAscending": False,
+            "maxResults": max_results, "page": 0,
+            "startDate": None, "endDate": None, "folderID": None,
+        }},
+        # 3. Full payload without sessionListScope
+        {"queryParameters": {
+            "query": "", "sortColumn": 1, "sortAscending": False,
+            "maxResults": max_results, "page": 0,
+            "startDate": None, "endDate": None, "folderID": None,
+            "bookmarked": False,
+        }},
+        # 4. Scope = 0 (all accessible sessions)
+        {"queryParameters": {
+            "query": "", "sortColumn": 1, "sortAscending": False,
+            "maxResults": max_results, "page": 0,
+            "startDate": None, "endDate": None, "folderID": None,
+            "bookmarked": False, "sessionListScope": 0,
+        }},
+        # 5. Scope = 2 (shared with me)
+        {"queryParameters": {
+            "query": "", "sortColumn": 1, "sortAscending": False,
+            "maxResults": max_results, "page": 0,
+            "startDate": None, "endDate": None, "folderID": None,
+            "bookmarked": False, "sessionListScope": 2,
+        }},
+    ]
+
+    last_err = ""
+    for payload in payloads:
+        try:
+            r = s.post(endpoint, json=payload, headers=hdrs, timeout=30)
+            if r.status_code == 200:
+                raw = r.json().get("d", {}).get("Results", [])
+                return _parse_webmethod_results(raw), f"webmethod payload={list(payload['queryParameters'].keys())}"
+            last_err = f"HTTP {r.status_code}: {r.text[:200]}"
+        except Exception as ex:
+            last_err = str(ex)
+
+    raise RuntimeError(f"All WebMethod payloads failed. Last error: {last_err}")
+
+
+def _scrape_list_aspx(s):
+    """Last-resort: parse session data embedded in List.aspx HTML.
+
+    Panopto injects a JavaScript object like:
+      Panopto.Utils.Data.SessionList.init({"Results":[...],...})
+    or stores it in a <script> block as a JSON variable.
+    """
+    list_url = f"{PANOPTO_BASE}/Panopto/Pages/Sessions/List.aspx"
+    r = s.get(list_url, allow_redirects=True, timeout=20)
+    if not r.ok:
+        raise RuntimeError(f"List.aspx returned {r.status_code}")
+
+    # Look for JSON blob containing "DeliveryID" or "SessionName" keys
+    patterns = [
+        r'Panopto\.[^(]+\.init\((\{.*?"Results".*?\})\)',
+        r'var\s+\w+\s*=\s*(\{.*?"Results".*?\});',
+        r'(\{"Results":\[.*?\].*?\})',
+    ]
+    for pat in patterns:
+        m = re.search(pat, r.text, re.DOTALL)
+        if m:
+            try:
+                data = json.loads(m.group(1))
+                raw = data.get("Results", [])
+                if raw:
+                    return _parse_webmethod_results(raw), "html_scrape"
+            except Exception:
+                continue
+
+    raise RuntimeError("Could not find session JSON in List.aspx HTML")
+
+
 def list_shared_sessions():
     s = get_session()
+    since = datetime(2026, 3, 1)
 
-    # Try the internal WebMethod first (works when REST API version is unsupported)
+    def _filter_since(items):
+        """Keep only sessions from March 2026 onwards (client-side filter)."""
+        out = []
+        for item in items:
+            start = item.get("StartTime", "")
+            try:
+                dt = datetime.fromisoformat(start.replace("Z", "").replace("+00:00", ""))
+                if dt >= since:
+                    out.append(item)
+            except Exception:
+                out.append(item)  # keep if we can't parse the date
+        return out
+
+    # 1. Internal WebMethod (tries multiple payload shapes)
     try:
-        results = _webmethod_sessions(s)
-        if results is not None:
-            return results
+        results, _method = _webmethod_sessions(s)
+        return _filter_since(results)
     except Exception:
         pass
 
-    # Fall back to REST API v1
-    params = {
-        "isSharedWithMe": "true",
-        "sortField": "StartTime",
-        "sortOrder": "Desc",
-        "pagination[maxResults]": 100,
-        "minStartDate": SINCE_DATE,
-    }
-    r = s.get(f"{PANOPTO_BASE}/Panopto/api/v1/sessions", params=params, timeout=30)
-    if r.status_code == 401:
-        reset_session()
-        s = get_session()
-        r = s.get(f"{PANOPTO_BASE}/Panopto/api/v1/sessions", params=params, timeout=30)
-    data = r.json()
-    results = data.get("Results", [])
-    since = datetime(2026, 3, 1)
-    filtered = []
-    for item in results:
-        start = item.get("StartTime", "")
+    # 2. REST API — try multiple version paths
+    for api_path in [
+        "/Panopto/api/v1/sessions",
+        "/Panopto/api/v1.0/sessions",
+        "/Panopto/api/sessions",
+    ]:
         try:
-            dt = datetime.fromisoformat(start.replace("Z", "+00:00").replace("+00:00", ""))
-            if dt >= since:
-                filtered.append(item)
+            r = s.get(
+                f"{PANOPTO_BASE}{api_path}",
+                params={"isSharedWithMe": "true", "sortField": "StartTime",
+                        "sortOrder": "Desc", "pagination[maxResults]": 100},
+                timeout=30,
+            )
+            if r.ok:
+                data = r.json()
+                return _filter_since(data.get("Results", []))
         except Exception:
-            filtered.append(item)
-    return filtered
+            pass
+
+    # 3. Scrape HTML of List.aspx
+    try:
+        results, _method = _scrape_list_aspx(s)
+        return _filter_since(results)
+    except Exception:
+        pass
+
+    raise RuntimeError(
+        "Could not fetch sessions via WebMethod, REST API, or HTML scraping. "
+        "Visit /debug for details."
+    )
 
 
 def get_session_detail(session_id):
@@ -640,7 +731,7 @@ def health():
     except Exception:
         browsers = []
     status = {
-        "version": "2026-04-14-v5",
+        "version": "2026-04-14-v6",
         "session_ready": session_is_ready(),
         "sso_last_error": _sso_last_error,
         "pw_browsers": browsers,
@@ -721,11 +812,11 @@ def debug():
         if request.args.get("fresh"):
             reset_session()
         s = get_session()
-        csrf = unquote(s.cookies.get("csrfToken", ""))
         list_url = f"{PANOPTO_BASE}/Panopto/Pages/Sessions/List.aspx"
         out["sso_status"] = _sso_last_error
         out["cookies"] = list(s.cookies.keys())
         out["has_aspxauth"] = ".ASPXAUTH" in [c.name for c in s.cookies]
+
         # Warmup: visit List.aspx so Panopto issues a fresh csrfToken
         try:
             warmup = s.get(list_url, allow_redirects=True, timeout=15)
@@ -733,29 +824,49 @@ def debug():
         except Exception as ex:
             out["list_aspx"] = f"ERR: {ex}"
         csrf = unquote(s.cookies.get("csrfToken", ""))
+        out["csrf_token"] = csrf[:40] + "..." if len(csrf) > 40 else (csrf or "(empty)")
 
-        # WebMethod (scope 0 = all, scope 2 = shared with me)
-        for scope in (2, 0):
+        hdrs = _webmethod_headers(csrf, list_url)
+        endpoint = f"{list_url}/GetSessions"
+
+        # Try all payload variations so we can see which one works
+        wm_payloads = {
+            "wm_bare":       {"queryParameters": {"query": "", "maxResults": 5, "page": 0}},
+            "wm_sort":       {"queryParameters": {"query": "", "sortColumn": 1, "sortAscending": False,
+                               "maxResults": 5, "page": 0, "startDate": None, "endDate": None, "folderID": None}},
+            "wm_no_scope":   {"queryParameters": {"query": "", "sortColumn": 1, "sortAscending": False,
+                               "maxResults": 5, "page": 0, "startDate": None, "endDate": None,
+                               "folderID": None, "bookmarked": False}},
+            "wm_scope0":     {"queryParameters": {"query": "", "sortColumn": 1, "sortAscending": False,
+                               "maxResults": 5, "page": 0, "startDate": None, "endDate": None,
+                               "folderID": None, "bookmarked": False, "sessionListScope": 0}},
+            "wm_scope2":     {"queryParameters": {"query": "", "sortColumn": 1, "sortAscending": False,
+                               "maxResults": 5, "page": 0, "startDate": None, "endDate": None,
+                               "folderID": None, "bookmarked": False, "sessionListScope": 2}},
+        }
+        for label, payload in wm_payloads.items():
             try:
-                payload = {"queryParameters": {"query": "", "sortColumn": 1,
-                           "sortAscending": False, "maxResults": 5, "page": 0,
-                           "startDate": None, "endDate": None, "folderID": None,
-                           "bookmarked": False, "sessionListScope": scope}}
-                rv = s.post(f"{list_url}/GetSessions", json=payload, timeout=15,
-                            headers={"X-CSRF-Token": csrf, "Accept": "application/json",
-                                     "Content-Type": "application/json; charset=UTF-8",
-                                     "Referer": list_url, "Origin": PANOPTO_BASE})
-                out[f"webmethod_scope{scope}"] = f"HTTP {rv.status_code} | {rv.text[:300]}"
+                rv = s.post(endpoint, json=payload, headers=hdrs, timeout=15)
+                # Show status + first 400 chars of body (enough to see error message or result count)
+                out[label] = f"HTTP {rv.status_code} | {rv.text[:400]}"
             except Exception as ex:
-                out[f"webmethod_scope{scope}"] = f"ERR: {ex}"
+                out[label] = f"ERR: {ex}"
 
-        # REST API fallback
+        # REST API — try multiple version paths
+        for api_path in ["/Panopto/api/v1/sessions", "/Panopto/api/sessions"]:
+            try:
+                ra = s.get(f"{PANOPTO_BASE}{api_path}",
+                           params={"isSharedWithMe": "true", "maxResults": 5}, timeout=15)
+                out[f"rest_{api_path.split('/')[-2]}"] = f"HTTP {ra.status_code} | {ra.text[:300]}"
+            except Exception as ex:
+                out[f"rest_{api_path.split('/')[-2]}"] = f"ERR: {ex}"
+
+        # HTML scrape attempt
         try:
-            ra = s.get(f"{PANOPTO_BASE}/Panopto/api/v1/sessions",
-                       params={"isSharedWithMe": "true", "maxResults": 5}, timeout=15)
-            out["rest_api"] = f"HTTP {ra.status_code} | {ra.text[:300]}"
+            results, method = _scrape_list_aspx(s)
+            out["html_scrape"] = f"OK via {method}: {len(results)} sessions"
         except Exception as ex:
-            out["rest_api"] = f"ERR: {ex}"
+            out["html_scrape"] = f"ERR: {ex}"
 
         lines = "\n\n".join(f"{k}:\n  {html_mod.escape(str(v))}" for k, v in out.items())
         body = f"""
