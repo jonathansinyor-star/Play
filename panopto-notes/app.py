@@ -74,6 +74,7 @@ def _try_sso_login():
 
     global _sso_last_error
     username = os.environ.get("MOODLE_USERNAME", "")
+    tau_id   = os.environ.get("TAU_ID", "")
     password = os.environ.get("MOODLE_PASSWORD", "")
 
     if not username or not password:
@@ -135,24 +136,29 @@ def _try_sso_login():
                 # May already be logged in or at an unexpected page
                 _sso_last_error += f" | no password field at {page.url[:80]}"
 
-            # 4. Fill credentials if a login form is present
+            # 4. Fill credentials — TAU NetIQ has THREE fields:
+            #    [Username/surname] [ID number] [Password]
             if page.locator("input[type='password']").count() > 0:
                 _sso_last_error += f" | filling creds at {page.url[:70]}"
-                # TAU uses NetIQ NIDP — Ecom_User_ID is the standard field name
-                for sel in ["input[name='Ecom_User_ID']", "input[id='username']",
-                            "input[name='username']", "input[type='email']",
-                            "input[type='text']"]:
-                    try:
-                        loc = page.locator(sel).first
-                        if loc.count() > 0:
-                            loc.fill(username)
-                            break
-                    except Exception:
-                        pass
+
+                # Collect all visible text inputs in order
+                text_inputs = page.locator(
+                    "input[type='text'], input[type='number'], input[type='tel'], "
+                    "input:not([type]), input[type='email']"
+                )
+                n_text = text_inputs.count()
+                _sso_last_error += f" | text_fields={n_text}"
+
+                if n_text >= 1:
+                    text_inputs.nth(0).fill(username)          # Field 1: surname
+                if n_text >= 2 and tau_id:
+                    text_inputs.nth(1).fill(tau_id)            # Field 2: student ID
+                elif n_text >= 2 and not tau_id:
+                    _sso_last_error += " | TAU_ID not set!"
+
                 page.locator("input[type='password']").first.fill(password)
 
-                # Prefer clicking the submit button — NIDP forms often don't
-                # submit correctly via Enter key alone
+                # Click submit button (NIDP forms often ignore Enter key)
                 submitted = False
                 for btn_sel in ["input[type='submit']", "button[type='submit']",
                                 "input[name='loginButton']", "button.btn-primary",
@@ -168,13 +174,13 @@ def _try_sso_login():
                         pass
                 if not submitted:
                     page.locator("input[type='password']").first.press("Enter")
-                _sso_last_error += f" | btn_click={submitted}"
-                # Brief wait then record where we ended up (MFA? CAPTCHA? wrong creds?)
+                _sso_last_error += f" | submitted={submitted}"
+
                 try:
                     page.wait_for_load_state("networkidle", timeout=8000)
                 except Exception:
                     pass
-                _sso_last_error += f" | post_submit_url={page.url[:90]}"
+                _sso_last_error += f" | post_submit={page.url[:90]}"
 
             # 5. Wait to land back on Panopto — SAML chain nidp→moodle→panopto
             #    can take 60-90s on TAU infrastructure
