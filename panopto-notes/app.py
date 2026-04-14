@@ -118,11 +118,11 @@ def _try_sso_login():
 
             # 4. Fill credentials if a login form is present
             if page.locator("input[type='password']").count() > 0:
-                _sso_last_error += " | filling credentials"
-                # Username field — try common selectors
-                for sel in ["input[type='text']", "input[type='email']",
-                            "input[name='username']", "input[name='Ecom_User_ID']",
-                            "input[name='j_username']", "input[id='username']"]:
+                _sso_last_error += f" | filling creds at {page.url[:70]}"
+                # TAU uses NetIQ NIDP — Ecom_User_ID is the standard field name
+                for sel in ["input[name='Ecom_User_ID']", "input[id='username']",
+                            "input[name='username']", "input[type='email']",
+                            "input[type='text']"]:
                     try:
                         loc = page.locator(sel).first
                         if loc.count() > 0:
@@ -131,14 +131,33 @@ def _try_sso_login():
                     except Exception:
                         pass
                 page.locator("input[type='password']").first.fill(password)
-                page.locator("input[type='password']").first.press("Enter")
 
-            # 5. Wait to land back on Panopto
+                # Prefer clicking the submit button — NIDP forms often don't
+                # submit correctly via Enter key alone
+                submitted = False
+                for btn_sel in ["input[type='submit']", "button[type='submit']",
+                                "input[name='loginButton']", "button.btn-primary",
+                                "button.btn", "input[value='Login']",
+                                "input[value='Log In']", "input[value='Sign In']"]:
+                    try:
+                        btn = page.locator(btn_sel).first
+                        if btn.count() > 0:
+                            btn.click(timeout=5000)
+                            submitted = True
+                            break
+                    except Exception:
+                        pass
+                if not submitted:
+                    page.locator("input[type='password']").first.press("Enter")
+                _sso_last_error += f" | btn_click={submitted}"
+
+            # 5. Wait to land back on Panopto — SAML chain nidp→moodle→panopto
+            #    can take 60-90s on TAU infrastructure
             _sso_last_error += " | waiting for Panopto redirect"
             try:
-                page.wait_for_url(f"{PANOPTO_BASE}/**", timeout=40000)
+                page.wait_for_url(f"{PANOPTO_BASE}/**", timeout=90000)
             except PWTimeout:
-                _sso_last_error += f" | redirect timeout, at {page.url[:80]}"
+                _sso_last_error += f" | redirect timeout, at {page.url[:100]}"
 
             # Brief settle so all cookies are written
             page.wait_for_timeout(2000)
@@ -223,6 +242,13 @@ def _parse_ms_date(date_str):
 
 def _webmethod_sessions(s, max_results=100):
     """Call Panopto's internal GetSessions WebMethod (what the web app uses)."""
+    list_url = f"{PANOPTO_BASE}/Panopto/Pages/Sessions/List.aspx"
+    # Visit the page first — this causes Panopto to issue/refresh the csrfToken
+    # cookie so our subsequent POST has a valid token.
+    try:
+        s.get(list_url, allow_redirects=True, timeout=15)
+    except Exception:
+        pass
     csrf = unquote(s.cookies.get("csrfToken", ""))
     payload = {
         "queryParameters": {
@@ -238,7 +264,6 @@ def _webmethod_sessions(s, max_results=100):
             "sessionListScope": 2,  # 2 = Shared with me
         }
     }
-    list_url = f"{PANOPTO_BASE}/Panopto/Pages/Sessions/List.aspx"
     r = s.post(
         f"{list_url}/GetSessions",
         json=payload,
