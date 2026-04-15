@@ -396,6 +396,76 @@ def _scrape_list_aspx(s):
     raise RuntimeError("Could not find session JSON in List.aspx HTML")
 
 
+def _playwright_list_sessions(s):
+    """Load List.aspx in a real browser with our session cookies and intercept
+    whichever API call the Panopto JavaScript itself makes to fetch sessions.
+
+    This is the nuclear option — we're reusing a browser so we don't have to
+    reverse-engineer the API.  Slow (~20s) but works regardless of API version.
+    """
+    from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
+
+    pw_cookies = []
+    for c in s.cookies:
+        pw_cookies.append({
+            "name": c.name,
+            "value": c.value,
+            "domain": "tau.cloud.panopto.eu",
+            "path": "/",
+        })
+
+    found = []
+
+    with sync_playwright() as p:
+        browser = p.chromium.launch(
+            headless=True,
+            args=["--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu"],
+        )
+        context = browser.new_context(
+            user_agent=(
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+            )
+        )
+        context.add_cookies(pw_cookies)
+        page = context.new_page()
+
+        def on_response(resp):
+            if resp.status != 200:
+                return
+            url = resp.url
+            if not any(k in url for k in ["/GetSessions", "/api/sessions",
+                                           "/api/v1/sessions", "/SessionList"]):
+                return
+            try:
+                data = resp.json()
+                # WebMethod: {"d": {"Results": [...]}}
+                raw = (data.get("d") or {}).get("Results") or []
+                if not raw:
+                    # REST: {"Results": [...]}
+                    raw = data.get("Results") or []
+                if raw:
+                    found.extend(_parse_webmethod_results(raw))
+            except Exception:
+                pass
+
+        page.on("response", on_response)
+
+        try:
+            page.goto(
+                f"{PANOPTO_BASE}/Panopto/Pages/Sessions/List.aspx",
+                wait_until="networkidle",
+                timeout=35000,
+            )
+            page.wait_for_timeout(6000)
+        except Exception:
+            pass
+
+        browser.close()
+
+    return found
+
+
 def list_shared_sessions():
     s = get_session()
     since = datetime(2026, 3, 1)
@@ -446,10 +516,10 @@ def list_shared_sessions():
     except Exception:
         pass
 
-    raise RuntimeError(
-        "Could not fetch sessions via WebMethod, REST API, or HTML scraping. "
-        "Visit /debug for details."
-    )
+    # 4. Use a real browser — intercept whichever API the Panopto JS actually calls
+    results = _playwright_list_sessions(s)
+    return _filter_since(results)
+    # (no raise — empty list is handled in the /lectures route)
 
 
 def get_session_detail(session_id):
@@ -731,7 +801,7 @@ def health():
     except Exception:
         browsers = []
     status = {
-        "version": "2026-04-14-v7",
+        "version": "2026-04-14-v8",
         "session_ready": session_is_ready(),
         "sso_last_error": _sso_last_error,
         "pw_browsers": browsers,
@@ -967,13 +1037,35 @@ def capture_api():
 
             browser.close()
 
-        result = {"requests": captured_req, "responses": captured_res}
+        # Also try to extract session names from what we captured
+        session_names = []
+        for entry in captured_res:
+            if '"SessionName"' in entry or '"Name"' in entry:
+                try:
+                    # Entry format: "HTTP 200 url: body..."
+                    body_start = entry.index(": ", entry.index("HTTP")) + 2
+                    raw_json = entry[body_start:]
+                    data = json.loads(raw_json)
+                    items = (data.get("d") or {}).get("Results") or data.get("Results") or []
+                    for it in items[:5]:
+                        name = it.get("SessionName") or it.get("Name", "")
+                        if name:
+                            session_names.append(name)
+                except Exception:
+                    pass
+
+        result = {
+            "sessions_found": session_names or "(none — see responses for raw data)",
+            "requests": captured_req,
+            "responses": captured_res,
+        }
         pre = html_mod.escape(json.dumps(result, indent=2))
         body = f"""
         <h1>Browser API Capture</h1>
         <p class="sub">API calls made by List.aspx in a real Chromium browser with your session cookies.</p>
         <div class="card"><pre style="white-space:pre-wrap;font-size:0.7rem;color:#94a3b8">{pre}</pre></div>
-        <a href="/debug" class="btn btn-primary">Back to Debug</a>"""
+        <a href="/lectures" class="btn btn-primary">Try Lectures Now</a>
+        &nbsp;<a href="/debug" class="btn btn-sm" style="color:#94a3b8">Back to Debug</a>"""
     except Exception as e:
         body = f'<h1>Capture Error</h1><div class="alert alert-err">{html_mod.escape(str(e))}</div>'
     return PAGE.format(body=body)
