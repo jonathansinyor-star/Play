@@ -656,38 +656,34 @@ def download_and_transcribe(session_id, download_url, caption_url):
 
     groq_client = Groq(api_key=os.environ["GROQ_API_KEY"])
 
-    # Download audio to /tmp
-    with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as f:
-        tmp_mp4 = f.name
     with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as f:
         tmp_mp3 = f.name
 
     try:
-        # Stream download
-        with s.get(download_url, stream=True, timeout=120) as r:
-            r.raise_for_status()
-            with open(tmp_mp4, "wb") as out:
-                for chunk in r.iter_content(chunk_size=1024 * 1024):
-                    out.write(chunk)
+        # Build cookie header string so ffmpeg can authenticate HLS/DASH streams.
+        # Panopto's DeliveryInfo.aspx returns HLS stream URLs (.m3u8), NOT direct
+        # MP4 downloads — ffmpeg handles these natively when given the URL directly.
+        cookie_str = "; ".join(f"{c.name}={c.value}" for c in s.cookies)
 
-        # Extract audio at 64kbps mono 16kHz to keep size small
         subprocess.run(
-            ["ffmpeg", "-y", "-i", tmp_mp4, "-vn", "-ar", "16000", "-ac", "1", "-ab", "64k", tmp_mp3],
-            check=True, capture_output=True,
+            ["ffmpeg", "-y",
+             "-headers", f"Cookie: {cookie_str}\r\n",
+             "-i", download_url,
+             "-vn", "-ar", "16000", "-ac", "1", "-ab", "64k", tmp_mp3],
+            check=True, capture_output=True, timeout=600,
         )
 
-        # Get duration in seconds via ffprobe
+        file_size = os.path.getsize(tmp_mp3)
         probe = subprocess.run(
             ["ffprobe", "-v", "error", "-show_entries", "format=duration",
              "-of", "default=noprint_wrappers=1:nokey=1", tmp_mp3],
             capture_output=True, text=True, check=True,
         )
         total_seconds = float(probe.stdout.strip())
-        file_size = os.path.getsize(tmp_mp3)
 
-        # Split into <20MB chunks for Groq's 25MB limit using ffmpeg
+        # Split into <20MB chunks for Groq's 25MB limit
         max_bytes = 20 * 1024 * 1024
-        num_chunks = math.ceil(file_size / max_bytes)
+        num_chunks = max(1, math.ceil(file_size / max_bytes))
         chunk_seconds = math.ceil(total_seconds / num_chunks)
 
         transcript_parts = []
@@ -709,16 +705,18 @@ def download_and_transcribe(session_id, download_url, caption_url):
                     )
                 transcript_parts.append(result if isinstance(result, str) else result.text)
             finally:
-                os.unlink(chunk_path)
+                try:
+                    os.unlink(chunk_path)
+                except Exception:
+                    pass
 
         return " ".join(transcript_parts), "whisper"
 
     finally:
-        for p in (tmp_mp4, tmp_mp3):
-            try:
-                os.unlink(p)
-            except Exception:
-                pass
+        try:
+            os.unlink(tmp_mp3)
+        except Exception:
+            pass
 
 
 # ---------------------------------------------------------------------------
@@ -877,7 +875,7 @@ def health():
     except Exception:
         browsers = []
     status = {
-        "version": "2026-04-14-v10",
+        "version": "2026-04-14-v11",
         "session_ready": session_is_ready(),
         "sso_last_error": _sso_last_error,
         "pw_browsers": browsers,
