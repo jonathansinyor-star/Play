@@ -466,6 +466,10 @@ def _playwright_list_sessions(s):
     return found
 
 
+# Module-level cache: session_id -> session dict (populated by list_shared_sessions)
+_sessions_cache = {}
+
+
 def list_shared_sessions():
     s = get_session()
     since = datetime(2026, 3, 1)
@@ -483,10 +487,16 @@ def list_shared_sessions():
                 out.append(item)  # keep if we can't parse the date
         return out
 
+    def _cache_and_filter(items):
+        for item in items:
+            if item.get("Id"):
+                _sessions_cache[item["Id"]] = item
+        return _filter_since(items)
+
     # 1. Internal WebMethod (tries multiple payload shapes)
     try:
         results, _method = _webmethod_sessions(s)
-        return _filter_since(results)
+        return _cache_and_filter(results)
     except Exception:
         pass
 
@@ -505,37 +515,75 @@ def list_shared_sessions():
             )
             if r.ok:
                 data = r.json()
-                return _filter_since(data.get("Results", []))
+                return _cache_and_filter(data.get("Results", []))
         except Exception:
             pass
 
     # 3. Scrape HTML of List.aspx
     try:
         results, _method = _scrape_list_aspx(s)
-        return _filter_since(results)
+        return _cache_and_filter(results)
     except Exception:
         pass
 
     # 4. Use a real browser — intercept whichever API the Panopto JS actually calls
     results = _playwright_list_sessions(s)
-    return _filter_since(results)
+    return _cache_and_filter(results)
     # (no raise — empty list is handled in the /lectures route)
 
 
 def get_session_detail(session_id):
     s = get_session()
-    # Try REST API first, fall back to looking in the session list
-    r = s.get(f"{PANOPTO_BASE}/Panopto/api/v1/sessions/{session_id}", timeout=20)
-    if r.ok:
-        return r.json()
-    # If REST API fails, fetch from WebMethod and find the matching session
+
+    # 1. Cache hit (populated when the lecture list was fetched)
+    cached = _sessions_cache.get(session_id, {})
+
+    # 2. DeliveryInfo.aspx — the viewer's own endpoint, works on all Panopto versions.
+    #    Returns streaming URLs, caption URI, and session metadata.
     try:
-        all_sessions = _webmethod_sessions(s, max_results=200)
-        for sess in all_sessions:
-            if sess.get("Id") == session_id:
-                return sess
+        r = s.get(
+            f"{PANOPTO_BASE}/Panopto/Pages/Viewer/DeliveryInfo.aspx",
+            params={"deliveryId": session_id, "getCaptions": "true",
+                    "resolution": "hls", "responseType": "json"},
+            timeout=20,
+        )
+        if r.ok:
+            data = r.json()
+            delivery = data.get("Delivery") or data
+            streams = delivery.get("Streams", []) or []
+            # Pick the first stream URL as audio source
+            audio_url = None
+            for stream in streams:
+                url = stream.get("StreamHttpUrl") or stream.get("StreamUrl", "")
+                if url:
+                    audio_url = url
+                    break
+            caption_uri = (delivery.get("CaptionDownloadUri")
+                           or delivery.get("CaptionsUri")
+                           or delivery.get("CaptionUri"))
+            return {
+                "Id": session_id,
+                "Name": cached.get("Name") or delivery.get("Name", "Untitled"),
+                "StartTime": cached.get("StartTime") or delivery.get("StartTime", ""),
+                "Duration": cached.get("Duration") or delivery.get("Duration"),
+                "DownloadUrl": audio_url,
+                "CaptionDownloadUrl": caption_uri,
+            }
     except Exception:
         pass
+
+    # 3. Return whatever we have from the listing cache
+    if cached:
+        return cached
+
+    # 4. REST API v1 (unlikely to work on TAU's instance but cheap to try)
+    try:
+        r = s.get(f"{PANOPTO_BASE}/Panopto/api/v1/sessions/{session_id}", timeout=20)
+        if r.ok:
+            return r.json()
+    except Exception:
+        pass
+
     return {}
 
 
@@ -566,14 +614,30 @@ def download_and_transcribe(session_id, download_url, caption_url):
     """Return (transcript_text, method_used)."""
     s = get_session()
 
-    # Try captions first — instant and free
-    if caption_url:
+    def _try_caption(url):
         try:
-            r = s.get(caption_url, timeout=20)
+            r = s.get(url, timeout=20)
             if r.ok and len(r.text) > 100:
-                return strip_srt_timestamps(r.text), "captions"
+                return strip_srt_timestamps(r.text)
         except Exception:
             pass
+        return None
+
+    # Try captions first — instant and free
+    if caption_url:
+        text = _try_caption(caption_url)
+        if text:
+            return text, "captions"
+
+    # Try Panopto's well-known caption/transcript endpoints (work on all versions)
+    for cap_url in [
+        f"{PANOPTO_BASE}/Panopto/Pages/Transcription/GenerateSRT.ashx?id={session_id}",
+        f"{PANOPTO_BASE}/Panopto/Pages/Transcription/GenerateVTT.ashx?id={session_id}",
+        f"{PANOPTO_BASE}/Panopto/Podcast/Cast.svc/caption/{session_id}.srt",
+    ]:
+        text = _try_caption(cap_url)
+        if text:
+            return text, "captions"
 
     if not download_url:
         return None, "no_source"
@@ -801,7 +865,7 @@ def health():
     except Exception:
         browsers = []
     status = {
-        "version": "2026-04-14-v8",
+        "version": "2026-04-14-v9",
         "session_ready": session_is_ready(),
         "sso_last_error": _sso_last_error,
         "pw_browsers": browsers,
