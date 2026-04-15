@@ -532,12 +532,38 @@ def list_shared_sessions():
     # (no raise — empty list is handled in the /lectures route)
 
 
+def _get_podcast_url(s, session_id):
+    """Return a direct downloadable audio URL from Panopto's Podcast endpoint.
+    These are real files (not HLS manifests) and work with session cookies.
+    Returns None if none of the known paths respond with 200."""
+    for path in [
+        f"/Panopto/Podcast/Cast.svc/MP3/{session_id}",
+        f"/Panopto/Podcast/Cast.svc/MP3?id={session_id}&isMp3=true",
+        f"/Panopto/Podcast/{session_id}/podcast.mp4",
+        f"/Panopto/Podcast/{session_id}/podcast.mp3",
+    ]:
+        try:
+            r = s.head(f"{PANOPTO_BASE}{path}", allow_redirects=True, timeout=10)
+            if r.ok and "text/html" not in r.headers.get("content-type", ""):
+                return f"{PANOPTO_BASE}{path}"
+        except Exception:
+            pass
+    return None
+
+
 def get_session_detail(session_id):
     s = get_session()
     cached = _sessions_cache.get(session_id, {})
 
-    # DeliveryInfo.aspx — the viewer's own endpoint. Try several param combos
-    # because older Panopto versions accept different subsets.
+    # 1. Always try Podcast endpoint first — it returns a real downloadable file,
+    #    not an HLS manifest. HLS streams from DeliveryInfo use CDN-signed URLs
+    #    that expire and can't be easily authenticated in ffmpeg.
+    podcast_url = _get_podcast_url(s, session_id)
+
+    # 2. DeliveryInfo.aspx — mainly for caption URL and metadata.
+    #    We use the HLS stream URL only as a last resort if no podcast URL found.
+    hls_url = None
+    caption_uri = None
     for params in [
         {"deliveryId": session_id, "getCaptions": "true", "responseType": "json"},
         {"deliveryId": session_id, "responseType": "json"},
@@ -546,55 +572,43 @@ def get_session_detail(session_id):
         try:
             r = s.get(
                 f"{PANOPTO_BASE}/Panopto/Pages/Viewer/DeliveryInfo.aspx",
-                params=params,
-                timeout=20,
+                params=params, timeout=20,
             )
             if not r.ok:
                 continue
-            ct = r.headers.get("content-type", "")
-            if "html" in ct:
-                # Login redirect — cookies not accepted for this endpoint
+            if "html" in r.headers.get("content-type", ""):
                 break
             data = r.json()
             delivery = data.get("Delivery") or data
-            streams = delivery.get("Streams", []) or []
-            audio_url = None
-            for stream in streams:
-                url = stream.get("StreamHttpUrl") or stream.get("StreamUrl", "")
-                if url:
-                    audio_url = url
-                    break
             caption_uri = (delivery.get("CaptionDownloadUri")
                            or delivery.get("CaptionsUri")
                            or delivery.get("CaptionUri"))
-            # If no stream found in DeliveryInfo, try Podcast audio endpoint
-            if not audio_url:
-                for podcast_path in [
-                    f"/Panopto/Podcast/Cast.svc/MP3/{session_id}",
-                    f"/Panopto/Podcast/{session_id}/podcast.mp3",
-                ]:
-                    try:
-                        head = s.head(f"{PANOPTO_BASE}{podcast_path}", timeout=10)
-                        if head.ok:
-                            audio_url = f"{PANOPTO_BASE}{podcast_path}"
-                            break
-                    except Exception:
-                        pass
+            if not podcast_url:
+                for stream in (delivery.get("Streams", []) or []):
+                    url = stream.get("StreamHttpUrl") or stream.get("StreamUrl", "")
+                    if url:
+                        hls_url = url
+                        break
             return {
                 "Id": session_id,
                 "Name": cached.get("Name") or delivery.get("Name", "Untitled"),
                 "StartTime": cached.get("StartTime") or delivery.get("StartTime", ""),
                 "Duration": cached.get("Duration") or delivery.get("Duration"),
-                "DownloadUrl": audio_url,
+                "DownloadUrl": podcast_url or hls_url,
                 "CaptionDownloadUrl": caption_uri,
                 "_detail_source": "DeliveryInfo",
+                "_url_type": "podcast" if podcast_url else ("hls" if hls_url else "none"),
             }
         except Exception:
             continue
 
-    # Fall back: return whatever we cached from the listing step
-    if cached:
-        return cached
+    # 3. Fall back to cache; inject podcast URL if we found one
+    if cached or podcast_url:
+        result = dict(cached)
+        if podcast_url:
+            result["DownloadUrl"] = podcast_url
+            result["_url_type"] = "podcast"
+        return result
 
     return {}
 
@@ -656,21 +670,28 @@ def download_and_transcribe(session_id, download_url, caption_url):
 
     groq_client = Groq(api_key=os.environ["GROQ_API_KEY"])
 
+    with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as f:
+        tmp_src = f.name
     with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as f:
         tmp_mp3 = f.name
 
     try:
-        # Build cookie header string so ffmpeg can authenticate HLS/DASH streams.
-        # Panopto's DeliveryInfo.aspx returns HLS stream URLs (.m3u8), NOT direct
-        # MP4 downloads — ffmpeg handles these natively when given the URL directly.
-        cookie_str = "; ".join(f"{c.name}={c.value}" for c in s.cookies)
+        # Download the audio file with session cookies (works for Podcast/MP4 endpoints)
+        with s.get(download_url, stream=True, timeout=300, allow_redirects=True) as r:
+            r.raise_for_status()
+            with open(tmp_src, "wb") as out:
+                for chunk in r.iter_content(chunk_size=1024 * 1024):
+                    out.write(chunk)
+
+        # Sanity check: reject tiny files (likely error pages or manifests, not audio)
+        src_size = os.path.getsize(tmp_src)
+        if src_size < 50_000:
+            return None, f"download_too_small ({src_size} bytes)"
 
         subprocess.run(
-            ["ffmpeg", "-y",
-             "-headers", f"Cookie: {cookie_str}\r\n",
-             "-i", download_url,
+            ["ffmpeg", "-y", "-i", tmp_src,
              "-vn", "-ar", "16000", "-ac", "1", "-ab", "64k", tmp_mp3],
-            check=True, capture_output=True, timeout=600,
+            check=True, capture_output=True, timeout=300,
         )
 
         file_size = os.path.getsize(tmp_mp3)
@@ -713,10 +734,11 @@ def download_and_transcribe(session_id, download_url, caption_url):
         return " ".join(transcript_parts), "whisper"
 
     finally:
-        try:
-            os.unlink(tmp_mp3)
-        except Exception:
-            pass
+        for p in (tmp_src, tmp_mp3):
+            try:
+                os.unlink(p)
+            except Exception:
+                pass
 
 
 # ---------------------------------------------------------------------------
@@ -875,7 +897,7 @@ def health():
     except Exception:
         browsers = []
     status = {
-        "version": "2026-04-14-v11",
+        "version": "2026-04-14-v12",
         "session_ready": session_is_ready(),
         "sso_last_error": _sso_last_error,
         "pw_browsers": browsers,
