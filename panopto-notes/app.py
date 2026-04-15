@@ -618,24 +618,27 @@ def get_session_detail(session_id):
 # ---------------------------------------------------------------------------
 
 def _playwright_get_media_urls(session_id):
-    """Open the Panopto viewer in a real browser and intercept:
-    - Any caption/transcript response (instant text, preferred)
-    - The CDN-signed HLS manifest URL (.m3u8 with auth token in URL)
+    """Open the Panopto viewer in a real browser and extract:
+    1. Captions/transcript text (preferred — instant, no quota usage)
+    2. CDN-signed HLS manifest URL as fallback for audio transcription
 
-    The CDN token is embedded directly in the m3u8 URL, so ffmpeg can
-    download the stream without needing cookie authentication.
+    Strategy for captions:
+    - Intercept any network response that looks like caption/transcript data
+    - Actively click the Transcript panel button to trigger caption loading
+    - Scrape the visible transcript text from the DOM
+
     Returns (caption_text_or_None, m3u8_url_or_None).
     """
     from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
 
     s = get_session()
-    pw_cookies = []
-    for c in s.cookies:
-        pw_cookies.append({"name": c.name, "value": c.value,
-                           "domain": "tau.cloud.panopto.eu", "path": "/"})
+    pw_cookies = [{"name": c.name, "value": c.value,
+                   "domain": "tau.cloud.panopto.eu", "path": "/"}
+                  for c in s.cookies]
 
     caption_text = None
     m3u8_url = None
+    fetched_caption_urls = []  # log for debugging
 
     with sync_playwright() as p:
         browser = p.chromium.launch(
@@ -655,15 +658,22 @@ def _playwright_get_media_urls(session_id):
             nonlocal m3u8_url
             url = req.url
             if ".m3u8" in url and not m3u8_url:
-                m3u8_url = url  # CDN-signed HLS manifest — token is in the URL
+                m3u8_url = url
 
         def on_response(resp):
             nonlocal caption_text
             if resp.status != 200 or caption_text:
                 return
             url = resp.url.lower()
-            if any(k in url for k in ["caption", "srt", "vtt", "transcript",
-                                       "generatesrt", "generatevtt"]):
+            ct = resp.headers.get("content-type", "").lower()
+            # Broad catch: any text response that looks like captions
+            is_caption_url = any(k in url for k in [
+                "caption", "srt", "vtt", "transcript",
+                "generatesrt", "generatevtt", "captions",
+            ])
+            is_text_vtt = "text/vtt" in ct or "text/plain" in ct
+            if is_caption_url or is_text_vtt:
+                fetched_caption_urls.append(resp.url[:120])
                 try:
                     text = resp.text()
                     if len(text) > 100:
@@ -679,13 +689,52 @@ def _playwright_get_media_urls(session_id):
                 f"{PANOPTO_BASE}/Panopto/Pages/Viewer.aspx?id={session_id}",
                 wait_until="networkidle", timeout=35000,
             )
-            page.wait_for_timeout(5000)
+            page.wait_for_timeout(3000)
+
+            # Actively open the Transcript panel to trigger caption loading
+            if not caption_text:
+                for btn_sel in [
+                    "button[title*='Transcript' i]",
+                    "button[aria-label*='transcript' i]",
+                    "[data-control='transcript']",
+                    ".viewer-nav-tab-transcript",
+                    "li[data-tab='transcript'] button",
+                    "button:has-text('Transcript')",
+                ]:
+                    try:
+                        btn = page.locator(btn_sel).first
+                        if btn.is_visible(timeout=2000):
+                            btn.click()
+                            page.wait_for_timeout(3000)
+                            break
+                    except Exception:
+                        pass
+
+            # Scrape transcript text directly from the DOM
+            if not caption_text:
+                for sel in [
+                    ".event-transcript-item",
+                    ".transcript-wrapper .transcript-line",
+                    ".viewer-transcript-wrapper",
+                    "[class*='transcript'] [class*='text']",
+                    "[class*='caption'] span",
+                ]:
+                    try:
+                        items = page.locator(sel).all_inner_texts()
+                        joined = " ".join(t.strip() for t in items if t.strip())
+                        if len(joined) > 200:
+                            caption_text = joined
+                            break
+                    except Exception:
+                        pass
+
         except Exception:
             pass
 
         browser.close()
 
     return caption_text, m3u8_url
+
 
 
 def strip_srt_timestamps(text):
@@ -820,13 +869,14 @@ def download_and_transcribe(session_id, download_url, caption_url):
             except Exception as groq_err:
                 err_str = str(groq_err)
                 if "rate_limit_exceeded" in err_str or "429" in err_str:
-                    # Extract wait time from Groq's error message if present
                     wait_match = re.search(r"try again in (\d+m\d+s|\d+s)", err_str)
                     wait_str = wait_match.group(1) if wait_match else "~15 minutes"
                     raise RuntimeError(
-                        f"Groq Whisper rate limit reached. "
-                        f"You've used your free 2h/hour audio quota. "
-                        f"Please wait {wait_str} and try again."
+                        f"Groq Whisper rate limit: free tier allows 2h audio/hour. "
+                        f"3-hour lectures need multiple sessions. "
+                        f"Wait {wait_str}, then try again. "
+                        f"Tip: if this lecture has auto-captions on Panopto, "
+                        f"they'll be used automatically (no quota needed)."
                     )
                 raise
             finally:
@@ -1001,7 +1051,7 @@ def health():
     except Exception:
         browsers = []
     status = {
-        "version": "2026-04-14-v14",
+        "version": "2026-04-14-v15",
         "session_ready": session_is_ready(),
         "sso_last_error": _sso_last_error,
         "pw_browsers": browsers,
