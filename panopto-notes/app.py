@@ -617,6 +617,77 @@ def get_session_detail(session_id):
 # Transcript extraction
 # ---------------------------------------------------------------------------
 
+def _playwright_get_media_urls(session_id):
+    """Open the Panopto viewer in a real browser and intercept:
+    - Any caption/transcript response (instant text, preferred)
+    - The CDN-signed HLS manifest URL (.m3u8 with auth token in URL)
+
+    The CDN token is embedded directly in the m3u8 URL, so ffmpeg can
+    download the stream without needing cookie authentication.
+    Returns (caption_text_or_None, m3u8_url_or_None).
+    """
+    from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
+
+    s = get_session()
+    pw_cookies = []
+    for c in s.cookies:
+        pw_cookies.append({"name": c.name, "value": c.value,
+                           "domain": "tau.cloud.panopto.eu", "path": "/"})
+
+    caption_text = None
+    m3u8_url = None
+
+    with sync_playwright() as p:
+        browser = p.chromium.launch(
+            headless=True,
+            args=["--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu"],
+        )
+        context = browser.new_context(
+            user_agent=(
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+            )
+        )
+        context.add_cookies(pw_cookies)
+        page = context.new_page()
+
+        def on_request(req):
+            nonlocal m3u8_url
+            url = req.url
+            if ".m3u8" in url and not m3u8_url:
+                m3u8_url = url  # CDN-signed HLS manifest — token is in the URL
+
+        def on_response(resp):
+            nonlocal caption_text
+            if resp.status != 200 or caption_text:
+                return
+            url = resp.url.lower()
+            if any(k in url for k in ["caption", "srt", "vtt", "transcript",
+                                       "generatesrt", "generatevtt"]):
+                try:
+                    text = resp.text()
+                    if len(text) > 100:
+                        caption_text = text
+                except Exception:
+                    pass
+
+        page.on("request", on_request)
+        page.on("response", on_response)
+
+        try:
+            page.goto(
+                f"{PANOPTO_BASE}/Panopto/Pages/Viewer.aspx?id={session_id}",
+                wait_until="networkidle", timeout=35000,
+            )
+            page.wait_for_timeout(5000)
+        except Exception:
+            pass
+
+        browser.close()
+
+    return caption_text, m3u8_url
+
+
 def strip_srt_timestamps(text):
     """Remove SRT/VTT timestamp lines, keep only spoken text."""
     lines = text.splitlines()
@@ -665,6 +736,19 @@ def download_and_transcribe(session_id, download_url, caption_url):
         if text:
             return text, "captions"
 
+    # Use Playwright to load the viewer and intercept captions + CDN stream URL.
+    # The CDN stream URL has the auth token embedded in the URL itself, so ffmpeg
+    # can download it without any cookie authentication.
+    try:
+        cap_text, m3u8_url = _playwright_get_media_urls(session_id)
+        if cap_text:
+            return strip_srt_timestamps(cap_text), "captions_playwright"
+        if m3u8_url:
+            # Replace the download_url with the CDN-signed m3u8 URL
+            download_url = m3u8_url
+    except Exception:
+        pass
+
     if not download_url:
         return None, "no_source"
 
@@ -683,16 +767,24 @@ def download_and_transcribe(session_id, download_url, caption_url):
                 for chunk in r.iter_content(chunk_size=1024 * 1024):
                     out.write(chunk)
 
-        # Sanity check: reject tiny files (likely error pages or manifests, not audio)
         src_size = os.path.getsize(tmp_src)
         if src_size < 50_000:
-            return None, f"download_too_small ({src_size} bytes)"
-
-        subprocess.run(
-            ["ffmpeg", "-y", "-i", tmp_src,
-             "-vn", "-ar", "16000", "-ac", "1", "-ab", "64k", tmp_mp3],
-            check=True, capture_output=True, timeout=300,
-        )
+            # File is too small to be real audio — likely an HLS manifest or error page.
+            # If the URL looks like HLS, pass it directly to ffmpeg (CDN token in URL).
+            if ".m3u8" in download_url or src_size < 5_000:
+                subprocess.run(
+                    ["ffmpeg", "-y", "-i", download_url,
+                     "-vn", "-ar", "16000", "-ac", "1", "-ab", "64k", tmp_mp3],
+                    check=True, capture_output=True, timeout=600,
+                )
+            else:
+                return None, f"download_too_small ({src_size} bytes — not audio)"
+        else:
+            subprocess.run(
+                ["ffmpeg", "-y", "-i", tmp_src,
+                 "-vn", "-ar", "16000", "-ac", "1", "-ab", "64k", tmp_mp3],
+                check=True, capture_output=True, timeout=300,
+            )
 
         file_size = os.path.getsize(tmp_mp3)
         probe = subprocess.run(
@@ -897,7 +989,7 @@ def health():
     except Exception:
         browsers = []
     status = {
-        "version": "2026-04-14-v12",
+        "version": "2026-04-14-v13",
         "session_ready": session_is_ready(),
         "sso_last_error": _sso_last_error,
         "pw_browsers": browsers,
@@ -1270,10 +1362,15 @@ def process(session_id):
 
             transcript, method = download_and_transcribe(session_id, download_url, caption_url)
             if not transcript:
+                detail_src = detail.get("_detail_source", "none")
+                url_type = detail.get("_url_type", "none")
                 yield PAGE.format(body=f"""
                 <h1>Error</h1>
-                <div class="alert alert-err">Could not retrieve transcript for this lecture.
-                The video may not have captions and no download URL was available.</div>
+                <div class="alert alert-err">
+                  Could not get transcript: <strong>{method}</strong><br><br>
+                  detail_source={detail_src} &middot; url_type={url_type}<br>
+                  download_url={bool(download_url)} &middot; caption_url={bool(caption_url)}
+                </div>
                 <a href="/lectures" class="btn btn-primary">Back</a>""")
                 return
 
