@@ -817,6 +817,18 @@ def download_and_transcribe(session_id, download_url, caption_url):
                         response_format="text",
                     )
                 transcript_parts.append(result if isinstance(result, str) else result.text)
+            except Exception as groq_err:
+                err_str = str(groq_err)
+                if "rate_limit_exceeded" in err_str or "429" in err_str:
+                    # Extract wait time from Groq's error message if present
+                    wait_match = re.search(r"try again in (\d+m\d+s|\d+s)", err_str)
+                    wait_str = wait_match.group(1) if wait_match else "~15 minutes"
+                    raise RuntimeError(
+                        f"Groq Whisper rate limit reached. "
+                        f"You've used your free 2h/hour audio quota. "
+                        f"Please wait {wait_str} and try again."
+                    )
+                raise
             finally:
                 try:
                     os.unlink(chunk_path)
@@ -989,7 +1001,7 @@ def health():
     except Exception:
         browsers = []
     status = {
-        "version": "2026-04-14-v13",
+        "version": "2026-04-14-v14",
         "session_ready": session_is_ready(),
         "sso_last_error": _sso_last_error,
         "pw_browsers": browsers,
