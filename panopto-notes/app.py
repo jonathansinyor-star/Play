@@ -534,24 +534,30 @@ def list_shared_sessions():
 
 def get_session_detail(session_id):
     s = get_session()
-
-    # 1. Cache hit (populated when the lecture list was fetched)
     cached = _sessions_cache.get(session_id, {})
 
-    # 2. DeliveryInfo.aspx — the viewer's own endpoint, works on all Panopto versions.
-    #    Returns streaming URLs, caption URI, and session metadata.
-    try:
-        r = s.get(
-            f"{PANOPTO_BASE}/Panopto/Pages/Viewer/DeliveryInfo.aspx",
-            params={"deliveryId": session_id, "getCaptions": "true",
-                    "resolution": "hls", "responseType": "json"},
-            timeout=20,
-        )
-        if r.ok:
+    # DeliveryInfo.aspx — the viewer's own endpoint. Try several param combos
+    # because older Panopto versions accept different subsets.
+    for params in [
+        {"deliveryId": session_id, "getCaptions": "true", "responseType": "json"},
+        {"deliveryId": session_id, "responseType": "json"},
+        {"deliveryId": session_id},
+    ]:
+        try:
+            r = s.get(
+                f"{PANOPTO_BASE}/Panopto/Pages/Viewer/DeliveryInfo.aspx",
+                params=params,
+                timeout=20,
+            )
+            if not r.ok:
+                continue
+            ct = r.headers.get("content-type", "")
+            if "html" in ct:
+                # Login redirect — cookies not accepted for this endpoint
+                break
             data = r.json()
             delivery = data.get("Delivery") or data
             streams = delivery.get("Streams", []) or []
-            # Pick the first stream URL as audio source
             audio_url = None
             for stream in streams:
                 url = stream.get("StreamHttpUrl") or stream.get("StreamUrl", "")
@@ -561,6 +567,19 @@ def get_session_detail(session_id):
             caption_uri = (delivery.get("CaptionDownloadUri")
                            or delivery.get("CaptionsUri")
                            or delivery.get("CaptionUri"))
+            # If no stream found in DeliveryInfo, try Podcast audio endpoint
+            if not audio_url:
+                for podcast_path in [
+                    f"/Panopto/Podcast/Cast.svc/MP3/{session_id}",
+                    f"/Panopto/Podcast/{session_id}/podcast.mp3",
+                ]:
+                    try:
+                        head = s.head(f"{PANOPTO_BASE}{podcast_path}", timeout=10)
+                        if head.ok:
+                            audio_url = f"{PANOPTO_BASE}{podcast_path}"
+                            break
+                    except Exception:
+                        pass
             return {
                 "Id": session_id,
                 "Name": cached.get("Name") or delivery.get("Name", "Untitled"),
@@ -568,21 +587,14 @@ def get_session_detail(session_id):
                 "Duration": cached.get("Duration") or delivery.get("Duration"),
                 "DownloadUrl": audio_url,
                 "CaptionDownloadUrl": caption_uri,
+                "_detail_source": "DeliveryInfo",
             }
-    except Exception:
-        pass
+        except Exception:
+            continue
 
-    # 3. Return whatever we have from the listing cache
+    # Fall back: return whatever we cached from the listing step
     if cached:
         return cached
-
-    # 4. REST API v1 (unlikely to work on TAU's instance but cheap to try)
-    try:
-        r = s.get(f"{PANOPTO_BASE}/Panopto/api/v1/sessions/{session_id}", timeout=20)
-        if r.ok:
-            return r.json()
-    except Exception:
-        pass
 
     return {}
 
@@ -865,7 +877,7 @@ def health():
     except Exception:
         browsers = []
     status = {
-        "version": "2026-04-14-v9",
+        "version": "2026-04-14-v10",
         "session_ready": session_is_ready(),
         "sso_last_error": _sso_last_error,
         "pw_browsers": browsers,
@@ -1296,28 +1308,28 @@ def process_all():
                 download_url = detail.get("DownloadUrl") or detail.get("Urls", {}).get("DownloadUrl")
                 caption_url = detail.get("CaptionDownloadUrl") or detail.get("Urls", {}).get("CaptionDownloadUrl")
 
-                transcript, _ = download_and_transcribe(session_id, download_url, caption_url)
+                transcript, method = download_and_transcribe(session_id, download_url, caption_url)
                 if transcript:
                     notes_md = generate_notes(title, date, transcript)
                     with open(notes_path(session_id), "w") as f:
                         f.write(notes_md)
-                    completed.append(title)
+                    completed.append(f"{title} ({method})")
                 else:
-                    failed.append(title)
-            except Exception:
-                failed.append(session_id)
+                    failed.append(f"{title} — no_source (download_url={bool(download_url)}, caption_url={bool(caption_url)}, detail_src={detail.get('_detail_source','none')})")
+            except Exception as e:
+                failed.append(f"{title or session_id} — {type(e).__name__}: {str(e)[:120]}")
 
         done_list = "".join(f"<li>{t}</li>" for t in completed)
-        fail_list = "".join(f"<li>{t}</li>" for t in failed)
-        fail_section = f'<div class="alert alert-err"><strong>Failed:</strong><ul>{fail_list}</ul></div>' if failed else ""
+        fail_list = "".join(f"<li style='word-break:break-all'>{t}</li>" for t in failed)
+        fail_section = f'<div class="alert alert-err"><strong>Failed ({len(failed)}):</strong><ul style="margin-top:8px;padding-left:16px;font-size:0.75rem">{fail_list}</ul></div>' if failed else ""
 
         yield PAGE.format(body=f"""
         <h1>All Done!</h1>
         <p class="sub">{len(completed)} of {total} lectures processed</p>
         {fail_section}
         <div class="card">
-          <strong style="color:#6ee7b7">Completed:</strong>
-          <ul style="margin-top:8px;padding-left:16px;font-size:0.875rem">{done_list}</ul>
+          <strong style="color:#6ee7b7">Completed ({len(completed)}):</strong>
+          <ul style="margin-top:8px;padding-left:16px;font-size:0.875rem">{done_list or '<li style=color:#64748b>none</li>'}</ul>
         </div>
         <br>
         <a href="/lectures" class="btn btn-success btn-full">Back to lectures to download</a>""")
