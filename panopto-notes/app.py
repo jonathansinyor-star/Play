@@ -731,7 +731,7 @@ def health():
     except Exception:
         browsers = []
     status = {
-        "version": "2026-04-14-v6",
+        "version": "2026-04-14-v7",
         "session_ready": session_is_ready(),
         "sso_last_error": _sso_last_error,
         "pw_browsers": browsers,
@@ -852,14 +852,24 @@ def debug():
             except Exception as ex:
                 out[label] = f"ERR: {ex}"
 
-        # REST API — try multiple version paths
-        for api_path in ["/Panopto/api/v1/sessions", "/Panopto/api/sessions"]:
+        # REST API — try the unversioned endpoint with different parameter shapes
+        # The unversioned /api/sessions returns "Cannot read sessions without a valid filter"
+        # when no params are sent — it IS alive, we just need the right params.
+        api_base = f"{PANOPTO_BASE}/Panopto/api/sessions"
+        for label, params in [
+            ("api_query",       {"query": ""}),
+            ("api_search",      {"searchQuery": ""}),
+            ("api_scope0_q",    {"query": "", "sessionListScopeType": "0", "maxResults": "5", "page": "0"}),
+            ("api_scope2_q",    {"query": "", "sessionListScopeType": "2", "maxResults": "5", "page": "0"}),
+            ("api_startidx",    {"searchQuery": "", "startIndex": "0", "count": "5"}),
+            ("api_v1",          {"isSharedWithMe": "true", "maxResults": "5"}),
+        ]:
+            url = api_base if label != "api_v1" else f"{PANOPTO_BASE}/Panopto/api/v1/sessions"
             try:
-                ra = s.get(f"{PANOPTO_BASE}{api_path}",
-                           params={"isSharedWithMe": "true", "maxResults": 5}, timeout=15)
-                out[f"rest_{api_path.split('/')[-2]}"] = f"HTTP {ra.status_code} | {ra.text[:300]}"
+                ra = s.get(url, params=params, timeout=15)
+                out[label] = f"HTTP {ra.status_code} | {ra.text[:300]}"
             except Exception as ex:
-                out[f"rest_{api_path.split('/')[-2]}"] = f"ERR: {ex}"
+                out[label] = f"ERR: {ex}"
 
         # HTML scrape attempt
         try:
@@ -874,9 +884,98 @@ def debug():
         <div class="card"><pre style="white-space:pre-wrap;font-size:0.75rem;color:#94a3b8">{lines}</pre></div>
         <a href="/lectures" class="btn btn-primary">Lectures</a>
         &nbsp;<a href="/debug?fresh=1" class="btn btn-sm" style="color:#94a3b8">Re-auth</a>
+        &nbsp;<a href="/capture-api" class="btn btn-sm" style="color:#a78bfa">Capture Browser API</a>
         &nbsp;<a href="/set-cookie" class="btn btn-sm" style="color:#94a3b8">Paste Cookies</a>"""
     except Exception as e:
         body = f'<h1>Debug Error</h1><div class="alert alert-err">{html_mod.escape(str(e))}</div>'
+    return PAGE.format(body=body)
+
+
+@app.route("/capture-api")
+def capture_api():
+    """Load List.aspx inside a real Playwright browser (with session cookies) and
+    intercept every API call it makes.  This tells us the exact URLs + payloads
+    that work with this Panopto instance."""
+    import html as html_mod
+    from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
+
+    captured_req = []
+    captured_res = []
+    s = get_session()
+
+    # Convert requests.Session cookies → Playwright cookie dicts
+    pw_cookies = []
+    for c in s.cookies:
+        pw_cookies.append({
+            "name": c.name,
+            "value": c.value,
+            "domain": "tau.cloud.panopto.eu",
+            "path": getattr(c, "path", "/") or "/",
+        })
+
+    try:
+        with sync_playwright() as p:
+            browser = p.chromium.launch(
+                headless=True,
+                args=["--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu"],
+            )
+            context = browser.new_context(
+                user_agent=(
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+                )
+            )
+            context.add_cookies(pw_cookies)
+            page = context.new_page()
+
+            def on_request(req_obj):
+                url = req_obj.url
+                if any(k in url for k in ["/Panopto/api/", "/GetSessions", "/GetFolders",
+                                           "/SessionList", "/sessions", "Session"]):
+                    captured_req.append({
+                        "method": req_obj.method,
+                        "url": url[:250],
+                        "post": (req_obj.post_data or "")[:400],
+                        "headers": {k: v for k, v in req_obj.headers.items()
+                                    if k.lower() in ("content-type", "x-csrf-token", "accept")},
+                    })
+
+            def on_response(resp_obj):
+                url = resp_obj.url
+                if any(k in url for k in ["/Panopto/api/", "/GetSessions", "/GetFolders",
+                                           "/SessionList", "/sessions"]):
+                    try:
+                        body_text = resp_obj.text()[:400]
+                    except Exception:
+                        body_text = "(unreadable)"
+                    captured_res.append(f"HTTP {resp_obj.status} {url[:200]}: {body_text}")
+
+            page.on("request", on_request)
+            page.on("response", on_response)
+
+            try:
+                page.goto(
+                    f"{PANOPTO_BASE}/Panopto/Pages/Sessions/List.aspx",
+                    wait_until="networkidle",
+                    timeout=30000,
+                )
+                # Give extra time for deferred AJAX calls
+                page.wait_for_timeout(6000)
+            except Exception as nav_err:
+                captured_req.append({"method": "NAV_ERR", "url": str(nav_err)[:200],
+                                      "post": "", "headers": {}})
+
+            browser.close()
+
+        result = {"requests": captured_req, "responses": captured_res}
+        pre = html_mod.escape(json.dumps(result, indent=2))
+        body = f"""
+        <h1>Browser API Capture</h1>
+        <p class="sub">API calls made by List.aspx in a real Chromium browser with your session cookies.</p>
+        <div class="card"><pre style="white-space:pre-wrap;font-size:0.7rem;color:#94a3b8">{pre}</pre></div>
+        <a href="/debug" class="btn btn-primary">Back to Debug</a>"""
+    except Exception as e:
+        body = f'<h1>Capture Error</h1><div class="alert alert-err">{html_mod.escape(str(e))}</div>'
     return PAGE.format(body=body)
 
 
