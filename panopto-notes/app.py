@@ -1051,7 +1051,7 @@ def health():
     except Exception:
         browsers = []
     status = {
-        "version": "2026-04-14-v15",
+        "version": "2026-04-14-v16",
         "session_ready": session_is_ready(),
         "sso_last_error": _sso_last_error,
         "pw_browsers": browsers,
@@ -1405,115 +1405,183 @@ def lectures():
     return PAGE.format(body=body)
 
 
-@app.route("/process/<session_id>", methods=["POST"])
-def process(session_id):
-    def stream():
-        yield PAGE.format(body=f"""
-        <h1>Generating Notes…</h1>
-        <p class="sub">This may take a few minutes for long lectures.</p>
-        <div class="card">
-          <div><span class="spinner"></span> Fetching lecture details…</div>
-        </div>""")
+# ---------------------------------------------------------------------------
+# Background job status — stored in /tmp so both gunicorn workers can read it
+# ---------------------------------------------------------------------------
 
+def _job_path(job_id):
+    return os.path.join(tempfile.gettempdir(), f"job_{job_id}.json")
+
+
+def _set_job(job_id, **kwargs):
+    with open(_job_path(job_id), "w") as f:
+        json.dump(kwargs, f)
+
+
+def _get_job(job_id):
+    try:
+        with open(_job_path(job_id)) as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def _run_single(session_id):
+    """Process one lecture in a background thread."""
+    try:
+        _set_job(session_id, status="working", msg="Fetching lecture details…")
+        detail = get_session_detail(session_id)
+        title = detail.get("Name", "Untitled")
+        date = _fmt_date(detail.get("StartTime", ""))
+        download_url = detail.get("DownloadUrl") or detail.get("Urls", {}).get("DownloadUrl")
+        caption_url = detail.get("CaptionDownloadUrl") or detail.get("Urls", {}).get("CaptionDownloadUrl")
+
+        _set_job(session_id, status="working", msg="Loading viewer &amp; extracting transcript…")
+        transcript, method = download_and_transcribe(session_id, download_url, caption_url)
+
+        if not transcript:
+            detail_src = detail.get("_detail_source", "none")
+            url_type = detail.get("_url_type", "none")
+            _set_job(session_id, status="error",
+                     msg=f"No transcript: {method} | detail_src={detail_src} url_type={url_type} "
+                         f"dl={bool(download_url)} cap={bool(caption_url)}")
+            return
+
+        _set_job(session_id, status="working", msg="Generating notes with AI…")
+        notes_md = generate_notes(title, date, transcript)
+        with open(notes_path(session_id), "w") as f:
+            f.write(notes_md)
+
+        source_label = "captions" if "caption" in method else "Whisper"
+        _set_job(session_id, status="done", msg=f"Notes ready ({source_label})", title=title, date=date)
+
+    except Exception as e:
+        _set_job(session_id, status="error", msg=str(e)[:300])
+
+
+def _run_all(ids):
+    """Process multiple lectures sequentially in a background thread."""
+    total = len(ids)
+    completed, failed = [], []
+    for i, sid in enumerate(ids, 1):
+        _set_job("all", status="working",
+                 msg=f"Lecture {i}/{total}…",
+                 completed=completed, failed=failed)
         try:
-            detail = get_session_detail(session_id)
+            detail = get_session_detail(sid)
             title = detail.get("Name", "Untitled")
             date = _fmt_date(detail.get("StartTime", ""))
-            download_url = detail.get("DownloadUrl") or detail.get("Urls", {}).get("DownloadUrl")
-            caption_url = detail.get("CaptionDownloadUrl") or detail.get("Urls", {}).get("CaptionDownloadUrl")
-
-            transcript, method = download_and_transcribe(session_id, download_url, caption_url)
-            if not transcript:
-                detail_src = detail.get("_detail_source", "none")
-                url_type = detail.get("_url_type", "none")
-                yield PAGE.format(body=f"""
-                <h1>Error</h1>
-                <div class="alert alert-err">
-                  Could not get transcript: <strong>{method}</strong><br><br>
-                  detail_source={detail_src} &middot; url_type={url_type}<br>
-                  download_url={bool(download_url)} &middot; caption_url={bool(caption_url)}
-                </div>
-                <a href="/lectures" class="btn btn-primary">Back</a>""")
-                return
-
-            notes_md = generate_notes(title, date, transcript)
-            with open(notes_path(session_id), "w") as f:
-                f.write(notes_md)
-
-            source_label = "auto-captions" if method == "captions" else "Whisper transcription"
-            yield PAGE.format(body=f"""
-            <h1>Notes Ready!</h1>
-            <p class="sub">Generated from {source_label}</p>
-            <div class="card">
-              <h3>{title}</h3>
-              <div class="meta">{date}</div>
-              <a href="/download/{session_id}" class="btn btn-success btn-full">Download .md file</a>
-            </div>
-            <br>
-            <a href="/lectures" class="btn btn-primary btn-full">Back to all lectures</a>""")
-
+            dl = detail.get("DownloadUrl") or detail.get("Urls", {}).get("DownloadUrl")
+            cap = detail.get("CaptionDownloadUrl") or detail.get("Urls", {}).get("CaptionDownloadUrl")
+            transcript, method = download_and_transcribe(sid, dl, cap)
+            if transcript:
+                notes_md = generate_notes(title, date, transcript)
+                with open(notes_path(sid), "w") as f:
+                    f.write(notes_md)
+                completed.append(f"{title} ({method})")
+            else:
+                failed.append(f"{title} — {method}")
         except Exception as e:
-            yield PAGE.format(body=f"""
-            <h1>Error</h1>
-            <div class="alert alert-err">{e}</div>
-            <a href="/lectures" class="btn btn-primary">Back</a>""")
+            failed.append(f"{sid[:8]}… — {type(e).__name__}: {str(e)[:80]}")
 
-    return Response(stream(), content_type="text/html")
+    _set_job("all", status="done", msg="All done",
+             completed=completed, failed=failed)
+
+
+@app.route("/process/<session_id>", methods=["POST"])
+def process(session_id):
+    _set_job(session_id, status="working", msg="Starting…")
+    _threading.Thread(target=_run_single, args=(session_id,), daemon=True).start()
+    return redirect(url_for("job_status", session_id=session_id))
+
+
+@app.route("/status/<session_id>")
+def job_status(session_id):
+    job = _get_job(session_id)
+    status = job.get("status", "working")
+    msg = job.get("msg", "Working…")
+
+    if status == "done":
+        title = job.get("title", "Lecture")
+        date = job.get("date", "")
+        body = f"""
+        <h1>Notes Ready!</h1>
+        <p class="sub">Generated successfully</p>
+        <div class="card">
+          <h3>{title}</h3>
+          <div class="meta">{date}</div>
+          <a href="/download/{session_id}" class="btn btn-success btn-full" style="margin-top:12px">
+            Download .md file
+          </a>
+        </div>
+        <br>
+        <a href="/lectures" class="btn btn-primary btn-full">Back to all lectures</a>"""
+    elif status == "error":
+        body = f"""
+        <h1>Error</h1>
+        <div class="alert alert-err">{msg}</div>
+        <a href="/lectures" class="btn btn-primary">Back</a>"""
+    else:
+        body = f"""
+        <h1>Generating Notes…</h1>
+        <p class="sub">Keep this page open — it updates automatically.</p>
+        <div class="card">
+          <div><span class="spinner"></span> {msg}</div>
+          <div class="meta" style="margin-top:8px">This takes 1–5 min depending on lecture length.</div>
+        </div>
+        <meta http-equiv="refresh" content="5">"""
+
+    return PAGE.format(body=body)
 
 
 @app.route("/process-all", methods=["POST"])
 def process_all():
     ids = json.loads(request.form.get("ids", "[]"))
+    _set_job("all", status="working", msg="Starting…", completed=[], failed=[])
+    _threading.Thread(target=_run_all, args=(ids,), daemon=True).start()
+    return redirect(url_for("job_all_status"))
 
-    def stream():
-        total = len(ids)
-        completed = []
-        failed = []
 
-        for i, session_id in enumerate(ids, 1):
-            progress_html = f"""
-            <h1>Generating All Notes…</h1>
-            <p class="sub">Processing {i} of {total} — please keep this page open</p>
-            <div class="card">
-              <div><span class="spinner"></span> Working on lecture {i}/{total}…</div>
-              <div class="meta" style="margin-top:8px">Completed: {len(completed)} &middot; Failed: {len(failed)}</div>
-            </div>"""
-            yield PAGE.format(body=progress_html)
+@app.route("/status-all")
+def job_all_status():
+    job = _get_job("all")
+    status = job.get("status", "working")
+    completed = job.get("completed", [])
+    failed = job.get("failed", [])
+    msg = job.get("msg", "Working…")
 
-            try:
-                detail = get_session_detail(session_id)
-                title = detail.get("Name", "Untitled")
-                date = _fmt_date(detail.get("StartTime", ""))
-                download_url = detail.get("DownloadUrl") or detail.get("Urls", {}).get("DownloadUrl")
-                caption_url = detail.get("CaptionDownloadUrl") or detail.get("Urls", {}).get("CaptionDownloadUrl")
+    done_list = "".join(f"<li>{t}</li>" for t in completed)
+    fail_list = "".join(f"<li style='word-break:break-all;font-size:0.75rem'>{t}</li>" for t in failed)
+    fail_html = f'<div class="alert alert-err"><strong>Failed ({len(failed)}):</strong><ul style="margin-top:6px;padding-left:16px">{fail_list}</ul></div>' if failed else ""
 
-                transcript, method = download_and_transcribe(session_id, download_url, caption_url)
-                if transcript:
-                    notes_md = generate_notes(title, date, transcript)
-                    with open(notes_path(session_id), "w") as f:
-                        f.write(notes_md)
-                    completed.append(f"{title} ({method})")
-                else:
-                    failed.append(f"{title} — no_source (download_url={bool(download_url)}, caption_url={bool(caption_url)}, detail_src={detail.get('_detail_source','none')})")
-            except Exception as e:
-                failed.append(f"{title or session_id} — {type(e).__name__}: {str(e)[:120]}")
-
-        done_list = "".join(f"<li>{t}</li>" for t in completed)
-        fail_list = "".join(f"<li style='word-break:break-all'>{t}</li>" for t in failed)
-        fail_section = f'<div class="alert alert-err"><strong>Failed ({len(failed)}):</strong><ul style="margin-top:8px;padding-left:16px;font-size:0.75rem">{fail_list}</ul></div>' if failed else ""
-
-        yield PAGE.format(body=f"""
+    if status == "done":
+        body = f"""
         <h1>All Done!</h1>
-        <p class="sub">{len(completed)} of {total} lectures processed</p>
-        {fail_section}
+        <p class="sub">{len(completed)} lectures completed, {len(failed)} failed</p>
+        {fail_html}
         <div class="card">
-          <strong style="color:#6ee7b7">Completed ({len(completed)}):</strong>
+          <strong style="color:#6ee7b7">Completed:</strong>
           <ul style="margin-top:8px;padding-left:16px;font-size:0.875rem">{done_list or '<li style=color:#64748b>none</li>'}</ul>
         </div>
         <br>
-        <a href="/lectures" class="btn btn-success btn-full">Back to lectures to download</a>""")
+        <a href="/lectures" class="btn btn-success btn-full">Back to lectures to download</a>"""
+    else:
+        body = f"""
+        <h1>Generating All Notes…</h1>
+        <p class="sub">Keep this page open — it updates every 8 seconds.</p>
+        <div class="card">
+          <div><span class="spinner"></span> {msg}</div>
+          <div class="meta" style="margin-top:8px">
+            Completed: {len(completed)} &middot; Failed: {len(failed)}
+          </div>
+        </div>
+        {fail_html}
+        {"".join(f'<div class=\"card\" style=\"border-color:#065f46\"><div class=\"meta\">{t}</div></div>' for t in completed[-3:])}
+        <meta http-equiv="refresh" content="8">"""
 
-    return Response(stream(), content_type="text/html")
+    return PAGE.format(body=body)
+
+
 
 
 @app.route("/download/<session_id>")
