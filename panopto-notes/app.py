@@ -900,9 +900,9 @@ def download_and_transcribe(session_id, download_url, caption_url):
                     wait_str = wait_match.group(1) if wait_match else "~15 minutes"
                     done_chunks = i
                     raise RuntimeError(
-                        f"Groq rate limit hit at chunk {done_chunks}/{num_chunks}. "
-                        f"Wait {wait_str}, then tap Generate Notes again — "
-                        f"it will resume from chunk {done_chunks} (no re-download needed)."
+                        f"RATE_LIMIT: Groq free tier: processed {done_chunks}/{num_chunks} chunks. "
+                        f"Wait {wait_str}, then tap Retry — "
+                        f"will resume from chunk {done_chunks} (no re-download needed)."
                     )
                 raise
             finally:
@@ -1079,7 +1079,7 @@ def health():
     except Exception:
         browsers = []
     status = {
-        "version": "2026-04-14-v17",
+        "version": "2026-04-16-v18",
         "session_ready": session_is_ready(),
         "sso_last_error": _sso_last_error,
         "pw_browsers": browsers,
@@ -1545,10 +1545,19 @@ def job_status(session_id):
         <br>
         <a href="/lectures" class="btn btn-primary btn-full">Back to all lectures</a>"""
     elif status == "error":
+        import html as _h
+        msg_esc = _h.escape(msg)
+        is_rate_limit = msg.startswith("RATE_LIMIT:")
+        retry_btn = (
+            f'<form method="post" action="/process/{session_id}" style="margin-top:12px">'
+            f'<button class="btn btn-primary btn-full" type="submit">Retry (resumes where it stopped)</button>'
+            f'</form>'
+        ) if is_rate_limit else ""
         body = f"""
-        <h1>Error</h1>
-        <div class="alert alert-err">{msg}</div>
-        <a href="/lectures" class="btn btn-primary">Back</a>"""
+        <h1>{"Rate Limit" if is_rate_limit else "Error"}</h1>
+        <div class="alert alert-err">{msg_esc}</div>
+        {retry_btn}
+        <br><a href="/lectures" class="btn btn-sm" style="color:#64748b">Back to lectures</a>"""
     else:
         body = f"""
         <h1>Generating Notes…</h1>
@@ -1617,10 +1626,17 @@ def download(session_id):
     path = notes_path(session_id)
     if not os.path.exists(path):
         return redirect(url_for("lectures", error="Notes file not found. Please generate notes first."))
+    job = _get_job(session_id)
+    title = job.get("title") or _sessions_cache.get(session_id, {}).get("Name", "")
+    if title:
+        safe = re.sub(r"[^\w\s-]", "", title).strip().replace(" ", "_")[:60]
+        fname = f"{safe}.md"
+    else:
+        fname = f"notes_{session_id[:8]}.md"
     return send_file(
         path,
         as_attachment=True,
-        download_name=f"notes_{session_id[:8]}.md",
+        download_name=fname,
         mimetype="text/markdown",
     )
 
