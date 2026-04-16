@@ -803,58 +803,83 @@ def download_and_transcribe(session_id, download_url, caption_url):
 
     groq_client = Groq(api_key=os.environ["GROQ_API_KEY"])
 
+    # Partial transcript cache — persists across rate-limit retries within
+    # the same Railway container lifetime (/tmp is not wiped between requests)
+    partial_path = os.path.join(tempfile.gettempdir(), f"partial_{session_id}.json")
+
+    def _load_partial():
+        try:
+            with open(partial_path) as f:
+                return json.load(f)
+        except Exception:
+            return {"chunks_done": 0, "parts": []}
+
+    def _save_partial(chunks_done, parts):
+        with open(partial_path, "w") as f:
+            json.dump({"chunks_done": chunks_done, "parts": parts}, f)
+
+    def _clear_partial():
+        try:
+            os.unlink(partial_path)
+        except Exception:
+            pass
+
+    # Keep the converted mp3 between retries so we skip re-download + ffmpeg
+    cached_mp3 = os.path.join(tempfile.gettempdir(), f"audio_{session_id}.mp3")
+    need_convert = not os.path.exists(cached_mp3) or os.path.getsize(cached_mp3) < 50_000
+
     with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as f:
         tmp_src = f.name
-    with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as f:
-        tmp_mp3 = f.name
 
     try:
-        # Download the audio file with session cookies (works for Podcast/MP4 endpoints)
-        with s.get(download_url, stream=True, timeout=300, allow_redirects=True) as r:
-            r.raise_for_status()
-            with open(tmp_src, "wb") as out:
-                for chunk in r.iter_content(chunk_size=1024 * 1024):
-                    out.write(chunk)
+        if need_convert:
+            # Download audio
+            with s.get(download_url, stream=True, timeout=300, allow_redirects=True) as r:
+                r.raise_for_status()
+                with open(tmp_src, "wb") as out:
+                    for chunk in r.iter_content(chunk_size=1024 * 1024):
+                        out.write(chunk)
 
-        src_size = os.path.getsize(tmp_src)
-        if src_size < 50_000:
-            # File is too small to be real audio — likely an HLS manifest or error page.
-            # If the URL looks like HLS, pass it directly to ffmpeg (CDN token in URL).
-            if ".m3u8" in download_url or src_size < 5_000:
-                subprocess.run(
-                    ["ffmpeg", "-y", "-i", download_url,
-                     "-vn", "-ar", "16000", "-ac", "1", "-ab", "64k", tmp_mp3],
-                    check=True, capture_output=True, timeout=600,
-                )
+            src_size = os.path.getsize(tmp_src)
+            if src_size < 50_000:
+                if ".m3u8" in download_url or src_size < 5_000:
+                    subprocess.run(
+                        ["ffmpeg", "-y", "-i", download_url,
+                         "-vn", "-ar", "16000", "-ac", "1", "-ab", "64k", cached_mp3],
+                        check=True, capture_output=True, timeout=600,
+                    )
+                else:
+                    return None, f"download_too_small ({src_size} bytes)"
             else:
-                return None, f"download_too_small ({src_size} bytes — not audio)"
-        else:
-            subprocess.run(
-                ["ffmpeg", "-y", "-i", tmp_src,
-                 "-vn", "-ar", "16000", "-ac", "1", "-ab", "64k", tmp_mp3],
-                check=True, capture_output=True, timeout=300,
-            )
+                subprocess.run(
+                    ["ffmpeg", "-y", "-i", tmp_src,
+                     "-vn", "-ar", "16000", "-ac", "1", "-ab", "64k", cached_mp3],
+                    check=True, capture_output=True, timeout=300,
+                )
 
-        file_size = os.path.getsize(tmp_mp3)
+        file_size = os.path.getsize(cached_mp3)
         probe = subprocess.run(
             ["ffprobe", "-v", "error", "-show_entries", "format=duration",
-             "-of", "default=noprint_wrappers=1:nokey=1", tmp_mp3],
+             "-of", "default=noprint_wrappers=1:nokey=1", cached_mp3],
             capture_output=True, text=True, check=True,
         )
         total_seconds = float(probe.stdout.strip())
 
-        # Split into <20MB chunks for Groq's 25MB limit
         max_bytes = 20 * 1024 * 1024
         num_chunks = max(1, math.ceil(file_size / max_bytes))
         chunk_seconds = math.ceil(total_seconds / num_chunks)
 
-        transcript_parts = []
-        for i in range(num_chunks):
+        # Resume from saved partial transcript if available
+        partial = _load_partial()
+        start_chunk = partial["chunks_done"]
+        transcript_parts = partial["parts"]
+
+        for i in range(start_chunk, num_chunks):
             start = i * chunk_seconds
             with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as cf:
                 chunk_path = cf.name
             subprocess.run(
-                ["ffmpeg", "-y", "-i", tmp_mp3, "-ss", str(start),
+                ["ffmpeg", "-y", "-i", cached_mp3, "-ss", str(start),
                  "-t", str(chunk_seconds), "-c", "copy", chunk_path],
                 check=True, capture_output=True,
             )
@@ -866,17 +891,18 @@ def download_and_transcribe(session_id, download_url, caption_url):
                         response_format="text",
                     )
                 transcript_parts.append(result if isinstance(result, str) else result.text)
+                _save_partial(i + 1, transcript_parts)  # save progress after each chunk
             except Exception as groq_err:
                 err_str = str(groq_err)
                 if "rate_limit_exceeded" in err_str or "429" in err_str:
+                    _save_partial(i, transcript_parts)  # keep what we have so far
                     wait_match = re.search(r"try again in (\d+m\d+s|\d+s)", err_str)
                     wait_str = wait_match.group(1) if wait_match else "~15 minutes"
+                    done_chunks = i
                     raise RuntimeError(
-                        f"Groq Whisper rate limit: free tier allows 2h audio/hour. "
-                        f"3-hour lectures need multiple sessions. "
-                        f"Wait {wait_str}, then try again. "
-                        f"Tip: if this lecture has auto-captions on Panopto, "
-                        f"they'll be used automatically (no quota needed)."
+                        f"Groq rate limit hit at chunk {done_chunks}/{num_chunks}. "
+                        f"Wait {wait_str}, then tap Generate Notes again — "
+                        f"it will resume from chunk {done_chunks} (no re-download needed)."
                     )
                 raise
             finally:
@@ -885,14 +911,16 @@ def download_and_transcribe(session_id, download_url, caption_url):
                 except Exception:
                     pass
 
+        _clear_partial()  # all done — remove the resume checkpoint
         return " ".join(transcript_parts), "whisper"
 
     finally:
-        for p in (tmp_src, tmp_mp3):
-            try:
-                os.unlink(p)
-            except Exception:
-                pass
+        try:
+            os.unlink(tmp_src)
+        except Exception:
+            pass
+        # Keep cached_mp3 for potential rate-limit resume; it's cleaned up
+        # automatically when the Railway container restarts.
 
 
 # ---------------------------------------------------------------------------
@@ -1051,7 +1079,7 @@ def health():
     except Exception:
         browsers = []
     status = {
-        "version": "2026-04-14-v16",
+        "version": "2026-04-14-v17",
         "session_ready": session_is_ready(),
         "sso_last_error": _sso_last_error,
         "pw_browsers": browsers,
