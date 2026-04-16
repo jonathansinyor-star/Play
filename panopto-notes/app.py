@@ -954,23 +954,73 @@ Produce notes in this EXACT markdown format:
 
 Be thorough. Use the actual content from the transcript. Do not add padding or repeat yourself."""
 
+CHUNK_PROMPT = """You are an expert academic note-taker. Extract ALL key information from this lecture section.
 
-def generate_notes(title, date, transcript):
+Lecture section transcript:
+{chunk}
+
+Write a thorough bullet-point summary covering EVERY important concept, definition, example, mechanism, and conclusion in this section. Be specific — include names, numbers, and details. Do not skip anything significant."""
+
+
+def generate_notes(title, date, transcript, status_cb=None):
+    import time
     groq_client = Groq(api_key=os.environ["GROQ_API_KEY"])
 
-    # Trim transcript to ~12000 words to stay within context
-    words = transcript.split()
-    if len(words) > 12000:
-        transcript = " ".join(words[:12000]) + "\n[transcript trimmed for length]"
+    def _call(messages, max_tokens):
+        """Call Groq LLaMA with automatic backoff on rate-limit errors."""
+        for attempt in range(5):
+            try:
+                return groq_client.chat.completions.create(
+                    model="llama-3.3-70b-versatile",
+                    messages=messages,
+                    temperature=0.3,
+                    max_tokens=max_tokens,
+                ).choices[0].message.content
+            except Exception as e:
+                err = str(e)
+                if "429" in err or "rate_limit" in err or "413" in err:
+                    m = re.search(r"try again in (\d+\.?\d*)s", err)
+                    wait = float(m.group(1)) + 2 if m else min(60 * (attempt + 1), 120)
+                    if status_cb:
+                        status_cb(f"AI rate limit — waiting {int(wait)}s then continuing…")
+                    time.sleep(wait)
+                    continue
+                raise
+        raise RuntimeError("Groq API failed after 5 retries")
 
-    prompt = NOTES_PROMPT.format(title=title, date=date, transcript=transcript)
-    response = groq_client.chat.completions.create(
-        model="llama-3.3-70b-versatile",
-        messages=[{"role": "user", "content": prompt}],
-        temperature=0.3,
-        max_tokens=4096,
-    )
-    return response.choices[0].message.content
+    words = transcript.split()
+    # Groq free tier: 12,000 TPM. Each call costs ~(input + max_output) tokens.
+    # 6500 words ≈ 7800 input tokens + 430 prompt + 2048 output ≈ 10,278 TPM — safe.
+    # Longer transcripts are chunked into 5000-word sections, each ≈ 7400 TPM.
+    DIRECT_LIMIT = 6500
+    CHUNK_WORDS = 5000
+
+    if len(words) <= DIRECT_LIMIT:
+        prompt = NOTES_PROMPT.format(title=title, date=date, transcript=transcript)
+        return _call([{"role": "user", "content": prompt}], max_tokens=2048)
+
+    # Long transcript (e.g. 3-hour lecture): map each chunk to a section summary,
+    # then synthesise all summaries into final structured notes.
+    chunks = [" ".join(words[i:i + CHUNK_WORDS]) for i in range(0, len(words), CHUNK_WORDS)]
+    summaries = []
+    for idx, chunk in enumerate(chunks, 1):
+        if status_cb:
+            status_cb(f"Generating notes — section {idx}/{len(chunks)}…")
+        try:
+            text = _call(
+                [{"role": "user", "content": CHUNK_PROMPT.format(chunk=chunk)}],
+                max_tokens=900,
+            )
+            summaries.append(f"[Section {idx}/{len(chunks)}]\n{text}")
+        except Exception as e:
+            summaries.append(f"[Section {idx}/{len(chunks)} — processing error: {e}]")
+
+    if status_cb:
+        status_cb("Synthesising all sections into final notes…")
+
+    combined = "\n\n".join(summaries)
+    final_prompt = NOTES_PROMPT.format(title=title, date=date, transcript=combined)
+    return _call([{"role": "user", "content": final_prompt}], max_tokens=2048)
 
 
 def notes_path(session_id):
@@ -1079,7 +1129,7 @@ def health():
     except Exception:
         browsers = []
     status = {
-        "version": "2026-04-16-v18",
+        "version": "2026-04-16-v19",
         "session_ready": session_is_ready(),
         "sso_last_error": _sso_last_error,
         "pw_browsers": browsers,
@@ -1476,7 +1526,8 @@ def _run_single(session_id):
             return
 
         _set_job(session_id, status="working", msg="Generating notes with AI…")
-        notes_md = generate_notes(title, date, transcript)
+        notes_md = generate_notes(title, date, transcript,
+                                  status_cb=lambda m: _set_job(session_id, status="working", msg=m))
         with open(notes_path(session_id), "w") as f:
             f.write(notes_md)
 
