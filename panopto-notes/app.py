@@ -48,12 +48,16 @@ _threading.Thread(target=_ensure_chromium, daemon=True).start()
 
 # Lock so only one SSO attempt runs at a time (warmup thread + request thread race)
 _session_lock = _threading.Lock()
+# Flag so auto-resume and manual Generate All don't both start at once
+_run_all_lock = _threading.Lock()
 
 PANOPTO_BASE = "https://tau.cloud.panopto.eu"
 SINCE_DATE = "2026-03-01T00:00:00.000Z"
 # Use Railway persistent volume at /data if available; else /tmp (lost on redeploy)
 NOTES_DIR = "/data" if os.path.isdir("/data") else tempfile.gettempdir()
 NOTES_PERSISTENT = os.path.isdir("/data")
+# Saved to /data so Generate All auto-resumes after a container restart
+_PENDING_ALL_PATH = os.path.join(NOTES_DIR, "pending_all.json")
 
 # ---------------------------------------------------------------------------
 # Auth
@@ -1201,7 +1205,7 @@ def health():
     except Exception:
         browsers = []
     status = {
-        "version": "2026-04-17-v30",
+        "version": "2026-04-17-v31",
         "session_ready": session_is_ready(),
         "sso_last_error": _sso_last_error,
         "pw_browsers": browsers,
@@ -1661,6 +1665,11 @@ def _run_single(session_id):
 
 def _run_all(ids):
     """Process all lectures sequentially, auto-retrying on rate limits."""
+    with _run_all_lock:
+        _run_all_locked(ids)
+
+
+def _run_all_locked(ids):
     total = len(ids)
     completed, failed = [], []
 
@@ -1750,6 +1759,11 @@ def _run_all(ids):
     _set_job("all", status="done",
              msg=f"All done — {len(completed)} completed, {len(failed)} failed",
              completed=completed, failed=failed)
+    # Clear the pending file so auto-resume doesn't restart a finished job
+    try:
+        os.unlink(_PENDING_ALL_PATH)
+    except Exception:
+        pass
 
 
 @app.route("/process/<session_id>", methods=["POST"])
@@ -1765,15 +1779,24 @@ def job_status(session_id):
     status = job.get("status", "")
     msg = job.get("msg", "")
 
-    # Empty job = file doesn't exist, likely killed by a redeploy
+    # Empty job = file doesn't exist, likely a container restart
     if not status:
-        body = f"""
-        <h1>Job Interrupted</h1>
-        <div class="alert alert-err">
-          The job was interrupted — most likely a redeploy restarted the server mid-run.<br><br>
-          Go back and tap <strong>Generate Notes</strong> again to restart.
-        </div>
-        <a href="/lectures" class="btn btn-primary btn-full">Back to lectures</a>"""
+        # Check if auto-resume is already running or pending
+        pending_exists = os.path.exists(_PENDING_ALL_PATH)
+        if pending_exists:
+            body = """
+            <h1>Resuming…</h1>
+            <p class="sub">Server restarted — auto-resuming in a few seconds.</p>
+            <div class="card"><div><span class="spinner"></span> Picking up where it stopped…</div></div>
+            <meta http-equiv="refresh" content="6">"""
+        else:
+            body = f"""
+            <h1>Job Not Found</h1>
+            <div class="alert alert-err">
+              The job was interrupted by a server restart.<br><br>
+              Go back and tap <strong>Generate Notes</strong> again to restart.
+            </div>
+            <a href="/lectures" class="btn btn-primary btn-full">Back to lectures</a>"""
         return PAGE.format(body=body)
 
     if status == "done":
@@ -1868,6 +1891,12 @@ def job_status(session_id):
 @app.route("/process-all", methods=["POST"])
 def process_all():
     ids = json.loads(request.form.get("ids", "[]"))
+    # Persist IDs so the job auto-resumes if the container restarts
+    try:
+        with open(_PENDING_ALL_PATH, "w") as f:
+            json.dump(ids, f)
+    except Exception:
+        pass
     _set_job("all", status="working", msg="Starting…", completed=[], failed=[])
     _threading.Thread(target=_run_all, args=(ids,), daemon=True).start()
     return redirect(url_for("job_all_status"))
@@ -1942,19 +1971,27 @@ def download(session_id):
 
 
 def _startup_warmup():
-    """Pre-warm the Panopto session so the first user request is instant.
-
-    Waits 8 seconds for the app to fully start (and for _ensure_chromium to
-    kick off), then triggers SSO in the background. By the time a user opens
-    the app URL the session is usually already cached.
-    """
-    import time
+    """Pre-warm SSO and auto-resume any Generate All job interrupted by a restart."""
     time.sleep(8)
     if os.environ.get("MOODLE_USERNAME") or os.environ.get("PANOPTO_COOKIE") or _runtime_cookie:
         try:
             get_session()
         except Exception:
             pass
+
+    # Auto-resume Generate All if the container restarted mid-job
+    try:
+        with open(_PENDING_ALL_PATH) as f:
+            all_ids = json.load(f)
+        # Only include lectures that don't have notes yet
+        remaining = [sid for sid in all_ids if not os.path.exists(notes_path(sid))]
+        if remaining and not _run_all_lock.locked():
+            _set_job("all", status="working",
+                     msg=f"Auto-resuming after restart — {len(remaining)} lectures remaining…",
+                     completed=[], failed=[])
+            _threading.Thread(target=_run_all, args=(remaining,), daemon=True).start()
+    except Exception:
+        pass  # No pending job, nothing to resume
 
 _threading.Thread(target=_startup_warmup, daemon=True).start()
 
