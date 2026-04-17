@@ -964,35 +964,27 @@ Output the following sections in order:
 ## What This Lecture Covers
 [2–3 sentences on the exact scope and its role in the course]
 
-## Core Concepts — Study These in Depth
-[For EACH major concept use a ### heading. Under each, write:
-- Full explanation: WHAT it is, HOW it works, WHY it matters
-- Specific facts, numbers, thresholds, formulas, and units
-- Step-by-step breakdown if it is a process or mechanism
-- Connections to other concepts
-- Exceptions and edge cases the lecturer flagged
-Aim for 8–15 bullet points per concept. Be SPECIFIC: "resting membrane potential is –70 mV" not "the voltage is negative".]
+## Every Point in This Lecture — Full Explanations
+Cover EVERY distinct point, argument, and idea the lecturer made, in the order they were presented. For each one use a ### heading and explain it thoroughly:
+- WHAT the point is, stated precisely
+- WHY the lecturer made it — the reasoning or evidence behind it
+- HOW it works if it involves a process, mechanism, or sequence (step by step)
+- Specific facts, numbers, formulas, thresholds, names, and units involved
+- Any examples or case studies the lecturer used to illustrate it (with full detail)
+- How it connects to or builds on other points in the lecture
+- Any exceptions, edge cases, or nuances flagged
+
+Do NOT group points vaguely under broad topics. Give every argument, sub-argument, and claim its own ### heading and deep treatment. If the lecturer spent 10 minutes on a concept, your notes for that concept should reflect that depth. Aim for at least 10 bullet points per major point.
 
 ## Definitions & Key Terms
-[EVERY term introduced in the lecture. Format: **Term**: precise exam-ready definition with enough detail to answer a definition question]
-
-## Mechanisms & Processes — Step by Step
-[For every process, pathway, algorithm, or sequence covered:
-### [Process Name]
-- Step 1: [exact description with details]
-- Step 2: …
-Include all inputs, outputs, conditions, and why each step matters]
+[EVERY term introduced. Format: **Term**: full definition plus context — when it applies, what distinguishes it from similar terms]
 
 ## Specific Facts for the Exam
-[The concrete, testable, specific items that actually appear on exams:
+[Concrete testable items:
 - Exact numbers, percentages, thresholds, dates, quantities
 - Named laws, rules, theorems, effects, criteria, classifications
 - Precise cause → effect relationships
-- Exceptions and special cases the lecturer emphasised
-- Anything the lecturer said "you need to know" or repeated]
-
-## Examples & Case Studies From the Lecture
-[Every concrete example or case study used, with ALL details the lecturer gave]
+- Exceptions and special cases the lecturer emphasised]
 
 ## Homework & Tasks
 [Any assignments, problem sets, readings, submissions, or deadlines mentioned. Be specific about what is required and when. If none mentioned: "None mentioned in this lecture."]
@@ -1014,23 +1006,25 @@ For the Guide panel in NotebookLM, add these questions:
 ## Key Takeaways — Ranked by Exam Importance
 [8–10 most important points from this lecture, ordered from most to least likely to appear on an exam. Be specific.]"""
 
-CHUNK_PROMPT = """You are extracting detailed exam-preparation material from a university lecture section. Be exhaustive — capture everything that could appear on an exam.
+CHUNK_PROMPT = """You are extracting deep study notes from a university lecture section. Your goal is comprehensive coverage of every point made — not a surface summary.
 
 Lecture section transcript:
 {chunk}
 
-Extract ALL of the following, being as specific as possible. Preserve exact facts, numbers, names, and wording:
+For EVERY distinct point, argument, or idea the lecturer makes:
+- State the point precisely
+- Explain the reasoning or evidence behind it
+- If it involves a process or mechanism: list every step in order
+- Include ALL specific facts: every number, formula, threshold, date, measurement, percentage
+- Include ALL examples used, with every detail given
+- Note any exceptions, nuances, or "important" flags the lecturer mentioned
 
-- Concepts: name + full explanation (what it is, how it works, why it matters)
-- Facts: every number, formula, threshold, date, measurement, percentage
-- Definitions: every term defined, with the exact definition given
-- Processes: every mechanism, pathway, or sequence, listed step by step with all details
-- Examples and case studies, with all details the lecturer gave
-- Anything the lecturer emphasised, repeated, called "important", or said students need to know
-- Homework, tasks, assignments, readings, or deadlines mentioned
+Also capture:
+- Every term defined, with its full definition
+- Homework, tasks, assignments, or deadlines mentioned
 - Lecturer's name if stated
 
-Use bullet points. Do not summarise vaguely. Preserve specific details even if they seem minor."""
+Use bullet points grouped by topic. Do NOT summarise vaguely — preserve specific details. If the lecturer spent a long time on something, your notes should reflect that."""
 
 
 def generate_notes(title, date, transcript, status_cb=None):
@@ -1200,7 +1194,7 @@ def health():
     except Exception:
         browsers = []
     status = {
-        "version": "2026-04-17-v21",
+        "version": "2026-04-17-v22",
         "session_ready": session_is_ready(),
         "sso_last_error": _sso_last_error,
         "pw_browsers": browsers,
