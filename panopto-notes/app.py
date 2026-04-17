@@ -1196,7 +1196,7 @@ def health():
     except Exception:
         browsers = []
     status = {
-        "version": "2026-04-17-v25",
+        "version": "2026-04-17-v26",
         "session_ready": session_is_ready(),
         "sso_last_error": _sso_last_error,
         "pw_browsers": browsers,
@@ -1739,12 +1739,12 @@ def job_status(session_id):
             </div>
             <script>
             (function(){{
-              var r={remaining}, ready={ready_now};
+              var deadline=Date.now()+{remaining}*1000, ready={ready_now};
               if(ready)return;
               var btn=document.getElementById('rb');
               var cd=document.getElementById('cd');
               var iv=setInterval(function(){{
-                r--;
+                var r=Math.max(0,Math.round((deadline-Date.now())/1000));
                 if(r<=0){{
                   clearInterval(iv);
                   cd.textContent='Ready — tap Retry below';
@@ -1754,7 +1754,7 @@ def job_status(session_id):
                   var m=Math.floor(r/60), s=r%60;
                   cd.textContent='Retry available in '+m+'m '+(s<10?'0':'')+s+'s';
                 }}
-              }},1000);
+              }},500);
             }})();
             </script>"""
         else:
