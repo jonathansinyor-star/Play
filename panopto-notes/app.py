@@ -51,7 +51,9 @@ _session_lock = _threading.Lock()
 
 PANOPTO_BASE = "https://tau.cloud.panopto.eu"
 SINCE_DATE = "2026-03-01T00:00:00.000Z"
-NOTES_DIR = tempfile.gettempdir()
+# Use Railway persistent volume at /data if available; else /tmp (lost on redeploy)
+NOTES_DIR = "/data" if os.path.isdir("/data") else tempfile.gettempdir()
+NOTES_PERSISTENT = os.path.isdir("/data")
 
 # ---------------------------------------------------------------------------
 # Auth
@@ -1194,7 +1196,9 @@ def health():
     except Exception:
         browsers = []
     status = {
-        "version": "2026-04-17-v22",
+        "version": "2026-04-17-v23",
+        "notes_dir": NOTES_DIR,
+        "notes_persistent": NOTES_PERSISTENT,
         "session_ready": session_is_ready(),
         "sso_last_error": _sso_last_error,
         "pw_browsers": browsers,
@@ -1540,11 +1544,18 @@ def lectures():
         <br>"""
 
     err_html = f'<div class="alert alert-err">{error}</div>' if error else ""
+    persist_warn = "" if NOTES_PERSISTENT else """
+    <div class="alert" style="border-color:#6366f1;color:#a5b4fc;font-size:0.8rem">
+      <strong>Notes are temporary</strong> — saved in /tmp and lost when Railway redeploys.<br>
+      To keep notes permanently: Railway dashboard → your service → <strong>Volumes</strong>
+      → Add Volume → Mount path <code>/data</code>. One-time setup.
+    </div>"""
     body = f"""
     <h1>Lecture Notes</h1>
     <p class="sub">{len(sessions)} lectures since March 2026 &nbsp;
       <a href="/lectures?refresh=1" style="font-size:0.8rem;color:#6366f1">Check for new lectures</a>
     </p>
+    {persist_warn}
     {err_html}
     {gen_all_btn}
     {''.join(cards)}"""
