@@ -1196,7 +1196,7 @@ def health():
     except Exception:
         browsers = []
     status = {
-        "version": "2026-04-17-v24",
+        "version": "2026-04-17-v25",
         "session_ready": session_is_ready(),
         "sso_last_error": _sso_last_error,
         "pw_browsers": browsers,
@@ -1632,7 +1632,18 @@ def _run_single(session_id):
         _set_job(session_id, status="done", msg=f"Notes ready ({source_label})", title=title, date=date)
 
     except Exception as e:
-        _set_job(session_id, status="error", msg=str(e)[:300])
+        err_str = str(e)
+        job_kwargs = {"status": "error", "msg": err_str[:300]}
+        if err_str.startswith("RATE_LIMIT:"):
+            m = re.search(r"(\d+)m(\d+)s", err_str)
+            if m:
+                wait_secs = int(m.group(1)) * 60 + int(m.group(2))
+            else:
+                m2 = re.search(r"(\d+)s\b", err_str)
+                wait_secs = int(m2.group(1)) if m2 else 900
+            job_kwargs["error_time"] = time.time()
+            job_kwargs["wait_seconds"] = wait_secs
+        _set_job(session_id, **job_kwargs)
 
 
 def _run_all(ids):
@@ -1709,11 +1720,45 @@ def job_status(session_id):
         import html as _h
         msg_esc = _h.escape(msg)
         is_rate_limit = msg.startswith("RATE_LIMIT:")
-        retry_btn = (
-            f'<form method="post" action="/process/{session_id}" style="margin-top:12px">'
-            f'<button class="btn btn-primary btn-full" type="submit">Retry (resumes where it stopped)</button>'
-            f'</form>'
-        ) if is_rate_limit else ""
+        if is_rate_limit:
+            error_time = job.get("error_time", time.time())
+            wait_secs = job.get("wait_seconds", 900)
+            remaining = max(0, int(wait_secs - (time.time() - error_time)))
+            ready_now = "true" if remaining == 0 else "false"
+            countdown_text = "Ready — tap Retry below" if remaining == 0 else f"Retry available in {remaining // 60}m {remaining % 60:02d}s"
+            retry_btn = f"""
+            <div style="margin-top:12px">
+              <div id="cd" style="text-align:center;font-size:0.95rem;margin-bottom:10px;
+                   color:{'#6ee7b7' if remaining == 0 else '#94a3b8'}">{countdown_text}</div>
+              <form method="post" action="/process/{session_id}" id="rf">
+                <button class="btn btn-primary btn-full" id="rb" type="submit"
+                        {'style=""' if remaining == 0 else 'disabled style="opacity:0.45;cursor:not-allowed"'}>
+                  Retry (resumes where it stopped)
+                </button>
+              </form>
+            </div>
+            <script>
+            (function(){{
+              var r={remaining}, ready={ready_now};
+              if(ready)return;
+              var btn=document.getElementById('rb');
+              var cd=document.getElementById('cd');
+              var iv=setInterval(function(){{
+                r--;
+                if(r<=0){{
+                  clearInterval(iv);
+                  cd.textContent='Ready — tap Retry below';
+                  cd.style.color='#6ee7b7';
+                  btn.disabled=false; btn.style.opacity='1'; btn.style.cursor='pointer';
+                }}else{{
+                  var m=Math.floor(r/60), s=r%60;
+                  cd.textContent='Retry available in '+m+'m '+(s<10?'0':'')+s+'s';
+                }}
+              }},1000);
+            }})();
+            </script>"""
+        else:
+            retry_btn = ""
         body = f"""
         <h1>{"Rate Limit" if is_rate_limit else "Error"}</h1>
         <div class="alert alert-err">{msg_esc}</div>
