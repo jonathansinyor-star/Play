@@ -823,9 +823,10 @@ def download_and_transcribe(session_id, download_url, caption_url):
 
     groq_client = Groq(api_key=os.environ["GROQ_API_KEY"])
 
-    # Partial transcript cache — persists across rate-limit retries within
-    # the same Railway container lifetime (/tmp is not wiped between requests)
-    partial_path = os.path.join(tempfile.gettempdir(), f"partial_{session_id}.json")
+    # All intermediate files go to NOTES_DIR (/data if volume mounted, else /tmp).
+    # This means partial transcripts and cached audio survive Railway restarts,
+    # so a crash mid-lecture picks up exactly where it stopped.
+    partial_path = os.path.join(NOTES_DIR, f"partial_{session_id}.json")
 
     def _load_partial():
         try:
@@ -844,8 +845,9 @@ def download_and_transcribe(session_id, download_url, caption_url):
         except Exception:
             pass
 
-    # Keep the converted mp3 between retries so we skip re-download + ffmpeg
-    cached_mp3 = os.path.join(tempfile.gettempdir(), f"audio_{session_id}.mp3")
+    # Cached audio also goes to NOTES_DIR so it survives a container restart.
+    # Deleted after successful transcription to free up space.
+    cached_mp3 = os.path.join(NOTES_DIR, f"audio_{session_id}.mp3")
     need_convert = not os.path.exists(cached_mp3) or os.path.getsize(cached_mp3) < 50_000
 
     with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as f:
@@ -932,6 +934,11 @@ def download_and_transcribe(session_id, download_url, caption_url):
                     pass
 
         _clear_partial()  # all done — remove the resume checkpoint
+        # Delete cached audio now that transcription is complete — frees space on /data
+        try:
+            os.unlink(cached_mp3)
+        except Exception:
+            pass
         return " ".join(transcript_parts), "whisper"
 
     finally:
@@ -939,8 +946,6 @@ def download_and_transcribe(session_id, download_url, caption_url):
             os.unlink(tmp_src)
         except Exception:
             pass
-        # Keep cached_mp3 for potential rate-limit resume; it's cleaned up
-        # automatically when the Railway container restarts.
 
 
 # ---------------------------------------------------------------------------
@@ -1196,7 +1201,7 @@ def health():
     except Exception:
         browsers = []
     status = {
-        "version": "2026-04-17-v28",
+        "version": "2026-04-17-v29",
         "session_ready": session_is_ready(),
         "sso_last_error": _sso_last_error,
         "pw_browsers": browsers,
@@ -1542,11 +1547,19 @@ def lectures():
         <br>"""
 
     err_html = f'<div class="alert alert-err">{error}</div>' if error else ""
+    no_volume_warn = "" if NOTES_PERSISTENT else """
+    <div class="alert" style="border-color:#f59e0b;color:#fcd34d;font-size:0.82rem">
+      <strong>&#9888; No persistent storage.</strong>
+      Notes &amp; progress are saved in /tmp and will be lost if Railway restarts.<br>
+      To fix: Railway dashboard &rarr; your service &rarr; <strong>New Volume</strong>
+      &rarr; mount path <code>/data</code>. One-time setup, takes 30 seconds.
+    </div>"""
     body = f"""
     <h1>Lecture Notes</h1>
     <p class="sub">{len(sessions)} lectures since March 2026 &nbsp;
       <a href="/lectures?refresh=1" style="font-size:0.8rem;color:#6366f1">Check for new lectures</a>
     </p>
+    {no_volume_warn}
     {err_html}
     {gen_all_btn}
     {''.join(cards)}
