@@ -1196,7 +1196,7 @@ def health():
     except Exception:
         browsers = []
     status = {
-        "version": "2026-04-17-v27",
+        "version": "2026-04-17-v28",
         "session_ready": session_is_ready(),
         "sso_last_error": _sso_last_error,
         "pw_browsers": browsers,
@@ -1647,31 +1647,67 @@ def _run_single(session_id):
 
 
 def _run_all(ids):
-    """Process multiple lectures sequentially in a background thread."""
+    """Process all lectures sequentially, auto-retrying on rate limits."""
     total = len(ids)
     completed, failed = [], []
-    for i, sid in enumerate(ids, 1):
-        _set_job("all", status="working",
-                 msg=f"Lecture {i}/{total}…",
+
+    def _status(msg):
+        _set_job("all", status="working", msg=msg,
                  completed=completed, failed=failed)
+
+    def _wait_for_rate_limit(err_str, attempt, title):
+        """Parse wait time from error, count down in status, return True to retry."""
+        m = re.search(r"(\d+)m(\d+)s", err_str)
+        if m:
+            wait_secs = int(m.group(1)) * 60 + int(m.group(2))
+        else:
+            m2 = re.search(r"(\d+)s\b", err_str)
+            wait_secs = int(m2.group(1)) if m2 else 900
+        wait_secs += 30  # small buffer beyond Groq's stated window
+        deadline = time.time() + wait_secs
+        while time.time() < deadline:
+            rem = max(0, int(deadline - time.time()))
+            mins, secs = divmod(rem, 60)
+            _status(f"Rate limit — resuming '{title[:35]}' in {mins}m{secs:02d}s "
+                    f"(attempt {attempt + 2}, no re-download needed)…")
+            time.sleep(5)
+
+    for i, sid in enumerate(ids, 1):
+        _status(f"Lecture {i}/{total} — fetching details…")
         try:
             detail = get_session_detail(sid)
-            title = detail.get("Name", "Untitled")
-            date = _fmt_date(detail.get("StartTime", ""))
-            dl = detail.get("DownloadUrl") or detail.get("Urls", {}).get("DownloadUrl")
-            cap = detail.get("CaptionDownloadUrl") or detail.get("Urls", {}).get("CaptionDownloadUrl")
-            transcript, method = download_and_transcribe(sid, dl, cap)
-            if transcript:
-                notes_md = generate_notes(title, date, transcript)
+        except Exception as e:
+            failed.append(f"Lecture {i} — details failed: {str(e)[:60]}")
+            continue
+
+        title = detail.get("Name", "Untitled")
+        date = _fmt_date(detail.get("StartTime", ""))
+        dl = detail.get("DownloadUrl") or detail.get("Urls", {}).get("DownloadUrl")
+        cap = detail.get("CaptionDownloadUrl") or detail.get("Urls", {}).get("CaptionDownloadUrl")
+
+        for attempt in range(8):  # up to 7 auto-retries per lecture
+            try:
+                _status(f"Lecture {i}/{total}: {title[:45]}…")
+                transcript, method = download_and_transcribe(sid, dl, cap)
+                if not transcript:
+                    failed.append(f"{title} — no audio source")
+                    break
+                notes_md = generate_notes(title, date, transcript, status_cb=_status)
                 with open(notes_path(sid), "w") as f:
                     f.write(notes_md)
                 completed.append(f"{title} ({method})")
-            else:
-                failed.append(f"{title} — {method}")
-        except Exception as e:
-            failed.append(f"{sid[:8]}… — {type(e).__name__}: {str(e)[:80]}")
+                break  # success — next lecture
+            except Exception as e:
+                err_str = str(e)
+                if err_str.startswith("RATE_LIMIT:") and attempt < 7:
+                    _wait_for_rate_limit(err_str, attempt, title)
+                    # loop continues — partial transcript is saved, will resume
+                else:
+                    failed.append(f"{title} — {str(e)[:100]}")
+                    break
 
-    _set_job("all", status="done", msg="All done",
+    _set_job("all", status="done",
+             msg=f"All done — {len(completed)} completed, {len(failed)} failed",
              completed=completed, failed=failed)
 
 
