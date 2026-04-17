@@ -1201,7 +1201,7 @@ def health():
     except Exception:
         browsers = []
     status = {
-        "version": "2026-04-17-v29",
+        "version": "2026-04-17-v30",
         "session_ready": session_is_ready(),
         "sso_last_error": _sso_last_error,
         "pw_browsers": browsers,
@@ -1669,55 +1669,83 @@ def _run_all(ids):
                  completed=completed, failed=failed)
 
     def _wait_for_rate_limit(err_str, attempt, title):
-        """Parse wait time from error, count down in status, return True to retry."""
         m = re.search(r"(\d+)m(\d+)s", err_str)
         if m:
-            wait_secs = int(m.group(1)) * 60 + int(m.group(2))
+            groq_wait = int(m.group(1)) * 60 + int(m.group(2))
         else:
             m2 = re.search(r"(\d+)s\b", err_str)
-            wait_secs = int(m2.group(1)) if m2 else 900
-        wait_secs += 30  # small buffer beyond Groq's stated window
+            groq_wait = int(m2.group(1)) if m2 else 900
+        # Early attempts: use Groq's stated time + small buffer
+        # Later attempts: wait a full hour to ensure rolling window fully resets
+        if attempt >= 3:
+            wait_secs = max(groq_wait, 3600) + 120
+        elif attempt >= 1:
+            wait_secs = groq_wait + 120
+        else:
+            wait_secs = groq_wait + 30
         deadline = time.time() + wait_secs
         while time.time() < deadline:
             rem = max(0, int(deadline - time.time()))
             mins, secs = divmod(rem, 60)
             _status(f"Rate limit — resuming '{title[:35]}' in {mins}m{secs:02d}s "
-                    f"(attempt {attempt + 2}, no re-download needed)…")
+                    f"(attempt {attempt + 2}/15, no re-download needed)…")
             time.sleep(5)
 
-    for i, sid in enumerate(ids, 1):
-        _status(f"Lecture {i}/{total} — fetching details…")
+    def _process_one(sid, i, total_n):
+        """Try one lecture with up to 14 retries. Returns (success, title, error)."""
         try:
             detail = get_session_detail(sid)
         except Exception as e:
-            failed.append(f"Lecture {i} — details failed: {str(e)[:60]}")
-            continue
-
+            return False, f"Lecture {i}", f"details failed: {str(e)[:60]}"
         title = detail.get("Name", "Untitled")
         date = _fmt_date(detail.get("StartTime", ""))
         dl = detail.get("DownloadUrl") or detail.get("Urls", {}).get("DownloadUrl")
         cap = detail.get("CaptionDownloadUrl") or detail.get("Urls", {}).get("CaptionDownloadUrl")
-
-        for attempt in range(8):  # up to 7 auto-retries per lecture
+        for attempt in range(15):
             try:
-                _status(f"Lecture {i}/{total}: {title[:45]}…")
+                _status(f"Lecture {i}/{total_n}: {title[:45]}…")
                 transcript, method = download_and_transcribe(sid, dl, cap)
                 if not transcript:
-                    failed.append(f"{title} — no audio source")
-                    break
+                    return False, title, "no audio source"
                 notes_md = generate_notes(title, date, transcript, status_cb=_status)
                 with open(notes_path(sid), "w") as f:
                     f.write(notes_md)
-                completed.append(f"{title} ({method})")
-                break  # success — next lecture
+                return True, title, method
             except Exception as e:
                 err_str = str(e)
-                if err_str.startswith("RATE_LIMIT:") and attempt < 7:
+                if err_str.startswith("RATE_LIMIT:") and attempt < 14:
                     _wait_for_rate_limit(err_str, attempt, title)
-                    # loop continues — partial transcript is saved, will resume
                 else:
-                    failed.append(f"{title} — {str(e)[:100]}")
-                    break
+                    return False, title, str(e)[:120]
+        return False, title, "max retries exceeded"
+
+    # Main pass
+    for i, sid in enumerate(ids, 1):
+        _status(f"Lecture {i}/{total} — starting…")
+        ok, title, info = _process_one(sid, i, total)
+        if ok:
+            completed.append(f"{title} ({info})")
+        else:
+            failed.append(f"{title} — {info}")
+
+    # Retry pass — attempt every failed lecture once more after the main run
+    if failed:
+        retry_ids = [sid for sid in ids
+                     if not os.path.exists(notes_path(sid))]
+        if retry_ids:
+            _status(f"Main pass done. Retrying {len(retry_ids)} failed lecture(s)…")
+            time.sleep(300)  # wait 5 min before retry pass
+            still_failed = []
+            for i, sid in enumerate(retry_ids, 1):
+                ok, title, info = _process_one(sid, i, len(retry_ids))
+                if ok:
+                    completed.append(f"{title} ({info}) [retry]")
+                    failed = [f for f in failed if not f.startswith(title)]
+                else:
+                    still_failed.append(f"{title} — {info}")
+            failed = [f for f in failed
+                      if any(f.startswith(t) for t in [x.split(" —")[0] for x in still_failed])]
+            failed = still_failed
 
     _set_job("all", status="done",
              msg=f"All done — {len(completed)} completed, {len(failed)} failed",
