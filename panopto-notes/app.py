@@ -1196,7 +1196,7 @@ def health():
     except Exception:
         browsers = []
     status = {
-        "version": "2026-04-17-v26",
+        "version": "2026-04-17-v27",
         "session_ready": session_is_ready(),
         "sso_last_error": _sso_last_error,
         "pw_browsers": browsers,
@@ -1685,8 +1685,19 @@ def process(session_id):
 @app.route("/status/<session_id>")
 def job_status(session_id):
     job = _get_job(session_id)
-    status = job.get("status", "working")
-    msg = job.get("msg", "Working…")
+    status = job.get("status", "")
+    msg = job.get("msg", "")
+
+    # Empty job = file doesn't exist, likely killed by a redeploy
+    if not status:
+        body = f"""
+        <h1>Job Interrupted</h1>
+        <div class="alert alert-err">
+          The job was interrupted — most likely a redeploy restarted the server mid-run.<br><br>
+          Go back and tap <strong>Generate Notes</strong> again to restart.
+        </div>
+        <a href="/lectures" class="btn btn-primary btn-full">Back to lectures</a>"""
+        return PAGE.format(body=body)
 
     if status == "done":
         title = job.get("title", "Lecture")
