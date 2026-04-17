@@ -1196,9 +1196,7 @@ def health():
     except Exception:
         browsers = []
     status = {
-        "version": "2026-04-17-v23",
-        "notes_dir": NOTES_DIR,
-        "notes_persistent": NOTES_PERSISTENT,
+        "version": "2026-04-17-v24",
         "session_ready": session_is_ready(),
         "sso_last_error": _sso_last_error,
         "pw_browsers": browsers,
@@ -1524,10 +1522,10 @@ def lectures():
             </form>"""
 
         cards.append(f"""
-        <div class="card">
+        <div class="card" data-sid="{sid}">
           <h3>{title}</h3>
           <div class="meta">{date} &middot; {dur} {badge}</div>
-          {action}
+          <div class="card-action">{action}</div>
         </div>""")
 
     gen_all_btn = ""
@@ -1544,21 +1542,41 @@ def lectures():
         <br>"""
 
     err_html = f'<div class="alert alert-err">{error}</div>' if error else ""
-    persist_warn = "" if NOTES_PERSISTENT else """
-    <div class="alert" style="border-color:#6366f1;color:#a5b4fc;font-size:0.8rem">
-      <strong>Notes are temporary</strong> — saved in /tmp and lost when Railway redeploys.<br>
-      To keep notes permanently: Railway dashboard → your service → <strong>Volumes</strong>
-      → Add Volume → Mount path <code>/data</code>. One-time setup.
-    </div>"""
     body = f"""
     <h1>Lecture Notes</h1>
     <p class="sub">{len(sessions)} lectures since March 2026 &nbsp;
       <a href="/lectures?refresh=1" style="font-size:0.8rem;color:#6366f1">Check for new lectures</a>
     </p>
-    {persist_warn}
     {err_html}
     {gen_all_btn}
-    {''.join(cards)}"""
+    {''.join(cards)}
+    <script>
+    (function(){{
+      document.querySelectorAll('[data-sid]').forEach(function(card){{
+        var sid=card.getAttribute('data-sid');
+        var stored=localStorage.getItem('pn_'+sid);
+        if(!stored)return;
+        var action=card.querySelector('.card-action');
+        if(!action)return;
+        // Don't override if server already shows a download link
+        if(action.querySelector('a[href*="/download/"]'))return;
+        var meta=JSON.parse(localStorage.getItem('pn_meta_'+sid)||'{{}}');
+        card.querySelector('.meta').insertAdjacentHTML('beforeend',' <span class="badge badge-ready">Saved</span>');
+        action.innerHTML='<button class="btn btn-success btn-sm btn-full" onclick="dlLocal(\''+sid+'\')">Download saved notes</button>';
+      }});
+      window.dlLocal=function(sid){{
+        var notes=localStorage.getItem('pn_'+sid);
+        if(!notes){{alert('Not found in browser storage.');return;}}
+        var meta=JSON.parse(localStorage.getItem('pn_meta_'+sid)||'{{}}');
+        var title=((meta.title)||'notes').replace(/[^\\w\\s-]/g,'').trim().replace(/\\s+/g,'_').substring(0,60)||'notes';
+        var blob=new Blob([notes],{{type:'text/markdown'}});
+        var a=document.createElement('a');
+        a.href=URL.createObjectURL(blob);
+        a.download=title+'.md';
+        document.body.appendChild(a);a.click();document.body.removeChild(a);
+      }};
+    }})();
+    </script>"""
     return PAGE.format(body=body)
 
 
@@ -1662,9 +1680,11 @@ def job_status(session_id):
     if status == "done":
         title = job.get("title", "Lecture")
         date = job.get("date", "")
+        title_js = json.dumps(title)
+        date_js = json.dumps(date)
         body = f"""
         <h1>Notes Ready!</h1>
-        <p class="sub">Generated successfully</p>
+        <p class="sub">Generated successfully — saved to your browser</p>
         <div class="card">
           <h3>{title}</h3>
           <div class="meta">{date}</div>
@@ -1673,7 +1693,18 @@ def job_status(session_id):
           </a>
         </div>
         <br>
-        <a href="/lectures" class="btn btn-primary btn-full">Back to all lectures</a>"""
+        <a href="/lectures" class="btn btn-primary btn-full">Back to all lectures</a>
+        <script>
+        fetch('/download/{session_id}?inline=1')
+          .then(function(r){{return r.ok?r.text():null;}})
+          .then(function(txt){{
+            if(!txt)return;
+            try{{
+              localStorage.setItem('pn_{session_id}',txt);
+              localStorage.setItem('pn_meta_{session_id}',JSON.stringify({{title:{title_js},date:{date_js}}}));
+            }}catch(e){{}}
+          }});
+        </script>"""
     elif status == "error":
         import html as _h
         msg_esc = _h.escape(msg)
@@ -1755,6 +1786,8 @@ def job_all_status():
 def download(session_id):
     path = notes_path(session_id)
     if not os.path.exists(path):
+        if request.args.get("inline"):
+            return "not found", 404
         return redirect(url_for("lectures", error="Notes file not found. Please generate notes first."))
     job = _get_job(session_id)
     title = job.get("title") or _sessions_cache.get(session_id, {}).get("Name", "")
@@ -1763,6 +1796,10 @@ def download(session_id):
         fname = f"{safe}.md"
     else:
         fname = f"notes_{session_id[:8]}.md"
+    # ?inline=1 returns raw text so JS can save it to localStorage
+    if request.args.get("inline"):
+        with open(path, encoding="utf-8") as f:
+            return f.read(), 200, {"Content-Type": "text/plain; charset=utf-8"}
     return send_file(
         path,
         as_attachment=True,
