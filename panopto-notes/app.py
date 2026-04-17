@@ -4,6 +4,7 @@ import json
 import subprocess
 import tempfile
 import math
+import time
 from datetime import datetime
 from urllib.parse import unquote
 from flask import Flask, request, session, Response, send_file, redirect, url_for
@@ -469,13 +470,15 @@ def _playwright_list_sessions(s):
 # Module-level cache: session_id -> session dict (populated by list_shared_sessions)
 _sessions_cache = {}
 
+_SESSIONS_LIST_CACHE = os.path.join(tempfile.gettempdir(), "sessions_list.json")
+_SESSIONS_LIST_TTL = 900  # 15 minutes — reload only when user clicks Refresh
 
-def list_shared_sessions():
+
+def list_shared_sessions(force_refresh=False):
     s = get_session()
     since = datetime(2026, 3, 1)
 
     def _filter_since(items):
-        """Keep only sessions from March 2026 onwards (client-side filter)."""
         out = []
         for item in items:
             start = item.get("StartTime", "")
@@ -484,19 +487,35 @@ def list_shared_sessions():
                 if dt >= since:
                     out.append(item)
             except Exception:
-                out.append(item)  # keep if we can't parse the date
+                out.append(item)
         return out
 
-    def _cache_and_filter(items):
+    def _cache_and_filter(items, save=False):
         for item in items:
             if item.get("Id"):
                 _sessions_cache[item["Id"]] = item
+        if save and items:
+            try:
+                with open(_SESSIONS_LIST_CACHE, "w") as f:
+                    json.dump({"ts": time.time(), "items": items}, f)
+            except Exception:
+                pass
         return _filter_since(items)
+
+    # Serve from file cache if fresh enough (avoids 20-30s Playwright run every load)
+    if not force_refresh:
+        try:
+            with open(_SESSIONS_LIST_CACHE) as f:
+                cached = json.load(f)
+            if time.time() - cached.get("ts", 0) < _SESSIONS_LIST_TTL:
+                return _cache_and_filter(cached.get("items", []))
+        except Exception:
+            pass
 
     # 1. Internal WebMethod (tries multiple payload shapes)
     try:
         results, _method = _webmethod_sessions(s)
-        return _cache_and_filter(results)
+        return _cache_and_filter(results, save=True)
     except Exception:
         pass
 
@@ -515,21 +534,20 @@ def list_shared_sessions():
             )
             if r.ok:
                 data = r.json()
-                return _cache_and_filter(data.get("Results", []))
+                return _cache_and_filter(data.get("Results", []), save=True)
         except Exception:
             pass
 
     # 3. Scrape HTML of List.aspx
     try:
         results, _method = _scrape_list_aspx(s)
-        return _cache_and_filter(results)
+        return _cache_and_filter(results, save=True)
     except Exception:
         pass
 
     # 4. Use a real browser — intercept whichever API the Panopto JS actually calls
     results = _playwright_list_sessions(s)
-    return _cache_and_filter(results)
-    # (no raise — empty list is handled in the /lectures route)
+    return _cache_and_filter(results, save=True)
 
 
 def _get_podcast_url(s, session_id):
@@ -927,43 +945,98 @@ def download_and_transcribe(session_id, download_url, caption_url):
 # Notes generation
 # ---------------------------------------------------------------------------
 
-NOTES_PROMPT = """You are an expert academic note-taker. Given the transcript of a university lecture, produce detailed structured study notes.
+NOTES_PROMPT = """You are an expert academic tutor creating the most comprehensive exam-preparation notes possible from a university lecture.
 
-Lecture title: {title}
+Lecture: {title}
 Date: {date}
 
 Transcript:
 {transcript}
 
-Produce notes in this EXACT markdown format:
+Create EXHAUSTIVE exam-focused notes. Include EVERY specific fact, number, name, formula, mechanism, and example from the transcript. Never write "was discussed" — state the actual content. A student must be able to ace an exam using ONLY these notes.
+
+Output the following sections in order:
 
 # {title}
 **Date:** {date}
+**Lecturer:** [Extract lecturer name from transcript if mentioned; otherwise write "Not stated"]
 
-## Overview
-[3-4 sentences summarising what the lecture covered and why it matters]
+## What This Lecture Covers
+[2–3 sentences on the exact scope and its role in the course]
 
-## Key Topics
-[For each major topic covered, use a ### heading and 4-8 bullet points explaining the key ideas, mechanisms, examples, and implications. Be specific and detailed enough that a student could study from these notes alone.]
+## Core Concepts — Study These in Depth
+[For EACH major concept use a ### heading. Under each, write:
+- Full explanation: WHAT it is, HOW it works, WHY it matters
+- Specific facts, numbers, thresholds, formulas, and units
+- Step-by-step breakdown if it is a process or mechanism
+- Connections to other concepts
+- Exceptions and edge cases the lecturer flagged
+Aim for 8–15 bullet points per concept. Be SPECIFIC: "resting membrane potential is –70 mV" not "the voltage is negative".]
 
 ## Definitions & Key Terms
-[A bullet list of important terms introduced, each formatted as **Term**: clear definition]
+[EVERY term introduced in the lecture. Format: **Term**: precise exam-ready definition with enough detail to answer a definition question]
 
-## Key Takeaways
-[A numbered list of the 5-8 most important things to remember from this lecture]
+## Mechanisms & Processes — Step by Step
+[For every process, pathway, algorithm, or sequence covered:
+### [Process Name]
+- Step 1: [exact description with details]
+- Step 2: …
+Include all inputs, outputs, conditions, and why each step matters]
 
-Be thorough. Use the actual content from the transcript. Do not add padding or repeat yourself."""
+## Specific Facts for the Exam
+[The concrete, testable, specific items that actually appear on exams:
+- Exact numbers, percentages, thresholds, dates, quantities
+- Named laws, rules, theorems, effects, criteria, classifications
+- Precise cause → effect relationships
+- Exceptions and special cases the lecturer emphasised
+- Anything the lecturer said "you need to know" or repeated]
 
-CHUNK_PROMPT = """You are an expert academic note-taker. Extract ALL key information from this lecture section.
+## Examples & Case Studies From the Lecture
+[Every concrete example or case study used, with ALL details the lecturer gave]
+
+## Homework & Tasks
+[Any assignments, problem sets, readings, submissions, or deadlines mentioned. Be specific about what is required and when. If none mentioned: "None mentioned in this lecture."]
+
+## Practice Exam Questions (With Detailed Answers)
+[12–15 specific exam questions this lecture content would generate, ranging from definition questions to application questions. For each: write the question, then write a complete answer.]
+
+## What to Study Next
+- Concepts mentioned but not fully explained — these need independent study
+- Prerequisite knowledge assumed by the lecturer — review if unclear
+- Topics that naturally follow from this material
+- Any textbooks, papers, chapters, or resources the lecturer mentioned (with full names)
+
+## NotebookLM Audio Overview — Ready to Use
+Upload this notes file to NotebookLM (notebooklm.google.com) as a source, then click "Audio Overview" and paste this prompt:
+
+"Create a podcast-style discussion of {title}. Cover the following in depth: [list the 3 most important concepts from this lecture]. Walk through the mechanism of [the most important process step by step]. Discuss what a student must know for an exam, including specific facts and numbers. End with a summary of the key takeaways."
+
+For the Guide panel in NotebookLM, add these questions:
+[List 6–8 specific questions based on this lecture's content that would make the Audio Overview more focused and useful]
+
+## Key Takeaways — Ranked by Exam Importance
+[8–10 most important points from this lecture, ordered from most to least likely to appear on an exam. Be specific.]"""
+
+CHUNK_PROMPT = """You are extracting detailed exam-preparation material from a university lecture section. Be exhaustive — capture everything that could appear on an exam.
 
 Lecture section transcript:
 {chunk}
 
-Write a thorough bullet-point summary covering EVERY important concept, definition, example, mechanism, and conclusion in this section. Be specific — include names, numbers, and details. Do not skip anything significant."""
+Extract ALL of the following, being as specific as possible. Preserve exact facts, numbers, names, and wording:
+
+- Concepts: name + full explanation (what it is, how it works, why it matters)
+- Facts: every number, formula, threshold, date, measurement, percentage
+- Definitions: every term defined, with the exact definition given
+- Processes: every mechanism, pathway, or sequence, listed step by step with all details
+- Examples and case studies, with all details the lecturer gave
+- Anything the lecturer emphasised, repeated, called "important", or said students need to know
+- Homework, tasks, assignments, readings, or deadlines mentioned
+- Lecturer's name if stated
+
+Use bullet points. Do not summarise vaguely. Preserve specific details even if they seem minor."""
 
 
 def generate_notes(title, date, transcript, status_cb=None):
-    import time
     groq_client = Groq(api_key=os.environ["GROQ_API_KEY"])
 
     def _call(messages, max_tokens):
@@ -989,38 +1062,39 @@ def generate_notes(title, date, transcript, status_cb=None):
         raise RuntimeError("Groq API failed after 5 retries")
 
     words = transcript.split()
-    # Groq free tier: 12,000 TPM. Each call costs ~(input + max_output) tokens.
-    # 6500 words ≈ 7800 input tokens + 430 prompt + 2048 output ≈ 10,278 TPM — safe.
-    # Longer transcripts are chunked into 5000-word sections, each ≈ 7400 TPM.
-    DIRECT_LIMIT = 6500
+    # Groq free tier: 12,000 TPM = input_tokens + max_output_tokens per minute.
+    # New detailed NOTES_PROMPT ≈ 800 tokens overhead.
+    # DIRECT path: 5000 words × 1.2 ≈ 6000 tokens + 800 prompt + 3500 output = 10,300 TPM ✓
+    # CHUNK path: 5000 words × 1.2 ≈ 6000 tokens + 200 chunk-prompt + 1000 output = 7,200 TPM ✓
+    # Synthesis: 6 chunks × 1000 tokens = 6000 + 800 prompt + 4096 output = 10,896 TPM ✓
+    DIRECT_LIMIT = 5000
     CHUNK_WORDS = 5000
 
     if len(words) <= DIRECT_LIMIT:
         prompt = NOTES_PROMPT.format(title=title, date=date, transcript=transcript)
-        return _call([{"role": "user", "content": prompt}], max_tokens=2048)
+        return _call([{"role": "user", "content": prompt}], max_tokens=3500)
 
-    # Long transcript (e.g. 3-hour lecture): map each chunk to a section summary,
-    # then synthesise all summaries into final structured notes.
+    # Long transcript: summarise each 5000-word chunk, then synthesise into full notes.
     chunks = [" ".join(words[i:i + CHUNK_WORDS]) for i in range(0, len(words), CHUNK_WORDS)]
     summaries = []
     for idx, chunk in enumerate(chunks, 1):
         if status_cb:
-            status_cb(f"Generating notes — section {idx}/{len(chunks)}…")
+            status_cb(f"Extracting detail — section {idx}/{len(chunks)}…")
         try:
             text = _call(
                 [{"role": "user", "content": CHUNK_PROMPT.format(chunk=chunk)}],
-                max_tokens=900,
+                max_tokens=1000,
             )
             summaries.append(f"[Section {idx}/{len(chunks)}]\n{text}")
         except Exception as e:
-            summaries.append(f"[Section {idx}/{len(chunks)} — processing error: {e}]")
+            summaries.append(f"[Section {idx}/{len(chunks)} — error: {e}]")
 
     if status_cb:
         status_cb("Synthesising all sections into final notes…")
 
     combined = "\n\n".join(summaries)
     final_prompt = NOTES_PROMPT.format(title=title, date=date, transcript=combined)
-    return _call([{"role": "user", "content": final_prompt}], max_tokens=2048)
+    return _call([{"role": "user", "content": final_prompt}], max_tokens=4096)
 
 
 def notes_path(session_id):
@@ -1129,7 +1203,7 @@ def health():
     except Exception:
         browsers = []
     status = {
-        "version": "2026-04-16-v19",
+        "version": "2026-04-17-v20",
         "session_ready": session_is_ready(),
         "sso_last_error": _sso_last_error,
         "pw_browsers": browsers,
@@ -1402,6 +1476,7 @@ def capture_api():
 @app.route("/lectures")
 def lectures():
     error = request.args.get("error")
+    force_refresh = request.args.get("refresh") == "1"
 
     # If SSO is still in progress (lock held by warmup thread), show a spinner
     # instead of blocking the HTTP connection for 60+ seconds.
@@ -1417,7 +1492,7 @@ def lectures():
         return PAGE.format(body=body)
 
     try:
-        sessions = list_shared_sessions()
+        sessions = list_shared_sessions(force_refresh=force_refresh)
     except Exception as e:
         reset_session()
         body = f"""
@@ -1476,7 +1551,9 @@ def lectures():
     err_html = f'<div class="alert alert-err">{error}</div>' if error else ""
     body = f"""
     <h1>Lecture Notes</h1>
-    <p class="sub">{len(sessions)} lectures shared with you since March 2026</p>
+    <p class="sub">{len(sessions)} lectures since March 2026 &nbsp;
+      <a href="/lectures?refresh=1" style="font-size:0.8rem;color:#6366f1">Check for new lectures</a>
+    </p>
     {err_html}
     {gen_all_btn}
     {''.join(cards)}"""
