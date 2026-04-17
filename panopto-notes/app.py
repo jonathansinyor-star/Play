@@ -997,9 +997,6 @@ Include all inputs, outputs, conditions, and why each step matters]
 ## Homework & Tasks
 [Any assignments, problem sets, readings, submissions, or deadlines mentioned. Be specific about what is required and when. If none mentioned: "None mentioned in this lecture."]
 
-## Practice Exam Questions (With Detailed Answers)
-[12–15 specific exam questions this lecture content would generate, ranging from definition questions to application questions. For each: write the question, then write a complete answer.]
-
 ## What to Study Next
 - Concepts mentioned but not fully explained — these need independent study
 - Prerequisite knowledge assumed by the lecturer — review if unclear
@@ -1203,7 +1200,7 @@ def health():
     except Exception:
         browsers = []
     status = {
-        "version": "2026-04-17-v20",
+        "version": "2026-04-17-v21",
         "session_ready": session_is_ready(),
         "sso_last_error": _sso_last_error,
         "pw_browsers": browsers,
