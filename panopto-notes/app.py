@@ -871,7 +871,7 @@ def download_and_transcribe(session_id, download_url, caption_url):
                 if ".m3u8" in download_url or src_size < 5_000:
                     subprocess.run(
                         ["ffmpeg", "-y", "-i", download_url,
-                         "-vn", "-ar", "16000", "-ac", "1", "-ab", "64k", cached_mp3],
+                         "-vn", "-ar", "16000", "-ac", "1", "-ab", "32k", cached_mp3],
                         check=True, capture_output=True, timeout=600,
                     )
                 else:
@@ -879,7 +879,7 @@ def download_and_transcribe(session_id, download_url, caption_url):
             else:
                 subprocess.run(
                     ["ffmpeg", "-y", "-i", tmp_src,
-                     "-vn", "-ar", "16000", "-ac", "1", "-ab", "64k", cached_mp3],
+                     "-vn", "-ar", "16000", "-ac", "1", "-ab", "32k", cached_mp3],
                     check=True, capture_output=True, timeout=300,
                 )
 
@@ -1205,7 +1205,7 @@ def health():
     except Exception:
         browsers = []
     status = {
-        "version": "2026-04-17-v31",
+        "version": "2026-04-18-v32",
         "session_ready": session_is_ready(),
         "sso_last_error": _sso_last_error,
         "pw_browsers": browsers,
@@ -1683,15 +1683,11 @@ def _run_all_locked(ids):
             groq_wait = int(m.group(1)) * 60 + int(m.group(2))
         else:
             m2 = re.search(r"(\d+)s\b", err_str)
-            groq_wait = int(m2.group(1)) if m2 else 900
-        # Early attempts: use Groq's stated time + small buffer
-        # Later attempts: wait a full hour to ensure rolling window fully resets
-        if attempt >= 3:
-            wait_secs = max(groq_wait, 3600) + 120
-        elif attempt >= 1:
-            wait_secs = groq_wait + 120
-        else:
-            wait_secs = groq_wait + 30
+            groq_wait = int(m2.group(1)) if m2 else 300
+        # Always trust Groq's stated retry-after time — rolling window is accurate.
+        # Add a small buffer that grows with attempts; never jump to a full hour.
+        buffer = min(30 + attempt * 20, 180)
+        wait_secs = groq_wait + buffer
         deadline = time.time() + wait_secs
         while time.time() < deadline:
             rem = max(0, int(deadline - time.time()))
