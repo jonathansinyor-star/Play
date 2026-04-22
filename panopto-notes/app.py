@@ -360,11 +360,22 @@ def _webmethod_sessions(s, max_results=100):
     last_err = ""
     for payload in payloads:
         try:
-            r = s.post(endpoint, json=payload, headers=hdrs, timeout=30)
-            if r.status_code == 200:
-                raw = r.json().get("d", {}).get("Results", [])
-                return _parse_webmethod_results(raw), f"webmethod payload={list(payload['queryParameters'].keys())}"
-            last_err = f"HTTP {r.status_code}: {r.text[:200]}"
+            all_raw = []
+            page = 0
+            while True:
+                paged = {**payload, "queryParameters": {**payload["queryParameters"], "page": page}}
+                r = s.post(endpoint, json=paged, headers=hdrs, timeout=30)
+                if r.status_code != 200:
+                    if page == 0:
+                        last_err = f"HTTP {r.status_code}: {r.text[:200]}"
+                    break
+                batch = r.json().get("d", {}).get("Results", [])
+                all_raw.extend(batch)
+                if len(batch) < max_results:
+                    break  # last page
+                page += 1
+            if all_raw:
+                return _parse_webmethod_results(all_raw), f"webmethod {len(all_raw)} sessions"
         except Exception as ex:
             last_err = str(ex)
 
@@ -525,22 +536,33 @@ def list_shared_sessions(force_refresh=False):
     except Exception:
         pass
 
-    # 2. REST API — try multiple version paths
+    # 2. REST API — try multiple version paths, paginating through all results
     for api_path in [
         "/Panopto/api/v1/sessions",
         "/Panopto/api/v1.0/sessions",
         "/Panopto/api/sessions",
     ]:
         try:
-            r = s.get(
-                f"{PANOPTO_BASE}{api_path}",
-                params={"isSharedWithMe": "true", "sortField": "StartTime",
-                        "sortOrder": "Desc", "pagination[maxResults]": 100},
-                timeout=30,
-            )
-            if r.ok:
+            all_results, offset = [], 0
+            while True:
+                r = s.get(
+                    f"{PANOPTO_BASE}{api_path}",
+                    params={"isSharedWithMe": "true", "sortField": "StartTime",
+                            "sortOrder": "Desc", "pagination[maxResults]": 100,
+                            "pagination[index]": offset},
+                    timeout=30,
+                )
+                if not r.ok:
+                    break
                 data = r.json()
-                return _cache_and_filter(data.get("Results", []), save=True)
+                batch = data.get("Results", [])
+                all_results.extend(batch)
+                total = data.get("TotalResultsCount", 0)
+                if len(batch) < 100 or (total and len(all_results) >= total):
+                    break
+                offset += 100
+            if all_results:
+                return _cache_and_filter(all_results, save=True)
         except Exception:
             pass
 
@@ -780,7 +802,7 @@ def strip_srt_timestamps(text):
     return " ".join(clean)
 
 
-def download_and_transcribe(session_id, download_url, caption_url):
+def download_and_transcribe(session_id, download_url, caption_url, status_cb=None):
     """Return (transcript_text, method_used)."""
     s = get_session()
 
@@ -882,6 +904,34 @@ def download_and_transcribe(session_id, download_url, caption_url):
                      "-vn", "-ar", "16000", "-ac", "1", "-ab", "32k", cached_mp3],
                     check=True, capture_output=True, timeout=300,
                 )
+
+        # Deepgram path — no chunking, no rate limits, uses free $200 credit
+        deepgram_key = os.environ.get("DEEPGRAM_API_KEY", "")
+        if deepgram_key:
+            try:
+                if status_cb:
+                    status_cb("Transcribing with Deepgram (no rate limits)…")
+                with open(cached_mp3, "rb") as af:
+                    resp = requests.post(
+                        "https://api.deepgram.com/v1/listen",
+                        params={"model": "nova-2", "smart_format": "true"},
+                        headers={"Authorization": f"Token {deepgram_key}",
+                                 "Content-Type": "audio/mp3"},
+                        data=af,
+                        timeout=600,
+                    )
+                resp.raise_for_status()
+                dg_transcript = (resp.json()["results"]["channels"][0]
+                                 ["alternatives"][0]["transcript"])
+                if dg_transcript.strip():
+                    _clear_partial()
+                    try:
+                        os.unlink(cached_mp3)
+                    except Exception:
+                        pass
+                    return dg_transcript, "deepgram"
+            except Exception:
+                pass  # fall through to Groq Whisper
 
         file_size = os.path.getsize(cached_mp3)
         probe = subprocess.run(
@@ -1205,7 +1255,7 @@ def health():
     except Exception:
         browsers = []
     status = {
-        "version": "2026-04-18-v32",
+        "version": "2026-04-22-v33",
         "session_ready": session_is_ready(),
         "sso_last_error": _sso_last_error,
         "pw_browsers": browsers,
@@ -1629,7 +1679,9 @@ def _run_single(session_id):
         caption_url = detail.get("CaptionDownloadUrl") or detail.get("Urls", {}).get("CaptionDownloadUrl")
 
         _set_job(session_id, status="working", msg="Loading viewer &amp; extracting transcript…")
-        transcript, method = download_and_transcribe(session_id, download_url, caption_url)
+        transcript, method = download_and_transcribe(
+            session_id, download_url, caption_url,
+            status_cb=lambda m: _set_job(session_id, status="working", msg=m))
 
         if not transcript:
             detail_src = detail.get("_detail_source", "none")
@@ -1709,7 +1761,7 @@ def _run_all_locked(ids):
         for attempt in range(15):
             try:
                 _status(f"Lecture {i}/{total_n}: {title[:45]}…")
-                transcript, method = download_and_transcribe(sid, dl, cap)
+                transcript, method = download_and_transcribe(sid, dl, cap, status_cb=_status)
                 if not transcript:
                     return False, title, "no audio source"
                 notes_md = generate_notes(title, date, transcript, status_cb=_status)
