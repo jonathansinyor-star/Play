@@ -1406,7 +1406,7 @@ def health():
     except Exception:
         browsers = []
     status = {
-        "version": "2026-04-23-v35",
+        "version": "2026-04-23-v36",
         "session_ready": session_is_ready(),
         "sso_last_error": _sso_last_error,
         "pw_browsers": browsers,
@@ -1450,7 +1450,7 @@ def index():
         body = '<h1>Lecture Notes</h1><div class="alert alert-err">Missing <code>GROQ_API_KEY</code> — add it in Railway Variables.</div>'
         return PAGE.format(body=body)
 
-    return redirect(url_for("lectures"))
+    return redirect(url_for("dashboard"))
 
 
 @app.route("/set-cookie", methods=["GET", "POST"])
@@ -1760,7 +1760,8 @@ def lectures():
       &rarr; mount path <code>/data</code>. One-time setup, takes 30 seconds.
     </div>"""
     body = f"""
-    <h1>Lecture Notes</h1>
+    <a href="/dashboard" style="color:#6366f1;font-size:0.875rem">← Dashboard</a>
+    <h1 style="margin-top:8px">Lecture List</h1>
     <p class="sub">{len(sessions)} lectures since March 2026 &nbsp;
       <a href="/lectures?refresh=1" style="font-size:0.8rem;color:#6366f1">Check for new lectures</a>
     </p>
@@ -2192,7 +2193,6 @@ def download(session_id):
 # Dashboard routes
 # ---------------------------------------------------------------------------
 
-@app.route("/")
 @app.route("/dashboard")
 def dashboard():
     metas = get_all_lecture_meta()
