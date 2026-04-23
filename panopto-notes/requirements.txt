@@ -3,3 +3,5 @@ gunicorn
 requests
 groq
 playwright==1.49.0
+edge-tts
+gtts

@@ -1,6 +1,7 @@
 import os
 import re
 import json
+import asyncio
 import subprocess
 import tempfile
 import math
@@ -1154,6 +1155,156 @@ def notes_path(session_id):
 
 
 # ---------------------------------------------------------------------------
+# Course classification, meta storage, and audio explainer
+# ---------------------------------------------------------------------------
+
+CLASSIFY_PROMPT = """You are organising university lecture notes into courses.
+
+Given these lecture notes, extract:
+1. COURSE: The subject/course name (e.g. "Business Law", "Microeconomics"). Use the exact same name for related lectures.
+2. LECTURER: The lecturer's name (e.g. "Dr. Cohen"). Write "Unknown" if not stated.
+3. TASKS: Any assignments, readings, submissions, or deadlines mentioned. Each as a complete sentence.
+
+Return ONLY valid JSON, no other text:
+{{"course": "...", "lecturer": "...", "tasks": ["..."]}}
+
+Title: {title}
+Date: {date}
+
+Notes excerpt:
+{notes_excerpt}"""
+
+EXPLAINER_SCRIPT_PROMPT = """Write a clear 900-word spoken audio guide for a student reviewing this lecture.
+
+Rules:
+- Plain spoken English only — no markdown, no headers, no bullet symbols, no asterisks
+- Speak directly to the student: "In this lecture you covered..." / "The key idea here is..."
+- Explain every major concept clearly, with the examples the lecturer used
+- Include specific facts, numbers, and named concepts from the lecture
+- End with: "The three things you must remember from this lecture are: one... two... three..."
+- Write as natural speech — this will be read aloud by text-to-speech
+
+Lecture: {title}
+Date: {date}
+
+Notes:
+{notes_excerpt}"""
+
+
+def _meta_path(session_id):
+    return os.path.join(NOTES_DIR, f"meta_{session_id}.json")
+
+
+def _load_meta(session_id):
+    try:
+        with open(_meta_path(session_id)) as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def _save_meta(session_id, **kwargs):
+    path = _meta_path(session_id)
+    try:
+        with open(path) as f:
+            existing = json.load(f)
+    except Exception:
+        existing = {}
+    existing.update(kwargs)
+    existing["session_id"] = session_id
+    with open(path, "w") as f:
+        json.dump(existing, f)
+
+
+def get_all_lecture_meta():
+    """All processed lecture meta dicts, newest first."""
+    metas = []
+    try:
+        for fname in os.listdir(NOTES_DIR):
+            if not (fname.startswith("notes_") and fname.endswith(".md")):
+                continue
+            sid = fname[6:-3]
+            meta = _load_meta(sid)
+            meta.setdefault("session_id", sid)
+            meta.setdefault("title", "Untitled")
+            meta.setdefault("date", "")
+            meta.setdefault("course", "Uncategorised")
+            meta.setdefault("lecturer", "Unknown")
+            meta.setdefault("tasks", [])
+            meta["has_explainer"] = os.path.exists(
+                os.path.join(NOTES_DIR, f"explainer_{sid}.mp3"))
+            metas.append(meta)
+    except Exception:
+        pass
+    return sorted(metas, key=lambda m: m.get("date", ""), reverse=True)
+
+
+def _course_slug(course_name):
+    return re.sub(r"[^a-z0-9]+", "-", course_name.lower()).strip("-") or "uncategorised"
+
+
+def classify_lecture(session_id, title, date, notes_md, groq_client=None):
+    """Ask LLaMA to classify lecture into a course and extract tasks. Saves to meta."""
+    if groq_client is None:
+        groq_client = Groq(api_key=os.environ["GROQ_API_KEY"])
+    try:
+        resp = groq_client.chat.completions.create(
+            model="llama-3.3-70b-versatile",
+            messages=[{"role": "user", "content": CLASSIFY_PROMPT.format(
+                title=title, date=date, notes_excerpt=notes_md[:3000])}],
+            temperature=0.1,
+            max_tokens=300,
+        ).choices[0].message.content
+        m = re.search(r"\{.*\}", resp, re.DOTALL)
+        if m:
+            data = json.loads(m.group())
+            _save_meta(session_id, title=title, date=date,
+                       course=data.get("course", "Uncategorised"),
+                       lecturer=data.get("lecturer", "Unknown"),
+                       tasks=data.get("tasks", []))
+            return
+    except Exception:
+        pass
+    _save_meta(session_id, title=title, date=date)
+
+
+def generate_explainer_audio(session_id, title, date, notes_md, status_cb=None, groq_client=None):
+    """Generate a podcast-style MP3 for a lecture using LLaMA script + edge-tts."""
+    audio_path = os.path.join(NOTES_DIR, f"explainer_{session_id}.mp3")
+    if os.path.exists(audio_path):
+        return
+    if groq_client is None:
+        groq_client = Groq(api_key=os.environ["GROQ_API_KEY"])
+    try:
+        if status_cb:
+            status_cb(f"Writing audio script for '{title[:35]}'…")
+        script = groq_client.chat.completions.create(
+            model="llama-3.3-70b-versatile",
+            messages=[{"role": "user", "content": EXPLAINER_SCRIPT_PROMPT.format(
+                title=title, date=date, notes_excerpt=notes_md[:4500])}],
+            temperature=0.4,
+            max_tokens=1200,
+        ).choices[0].message.content
+
+        if status_cb:
+            status_cb("Converting script to audio (edge-tts)…")
+        try:
+            import edge_tts
+
+            async def _speak():
+                comm = edge_tts.Communicate(script, "en-US-AriaNeural")
+                await comm.save(audio_path)
+
+            asyncio.run(_speak())
+        except Exception:
+            # Fallback: gTTS
+            from gtts import gTTS
+            gTTS(text=script, lang="en").save(audio_path)
+    except Exception:
+        pass  # explainer is optional — never blocks notes pipeline
+
+
+# ---------------------------------------------------------------------------
 # HTML helpers
 # ---------------------------------------------------------------------------
 
@@ -1255,7 +1406,7 @@ def health():
     except Exception:
         browsers = []
     status = {
-        "version": "2026-04-22-v33",
+        "version": "2026-04-23-v34",
         "session_ready": session_is_ready(),
         "sso_last_error": _sso_last_error,
         "pw_browsers": browsers,
@@ -1700,6 +1851,16 @@ def _run_single(session_id):
         source_label = "captions" if "caption" in method else "Whisper"
         _set_job(session_id, status="done", msg=f"Notes ready ({source_label})", title=title, date=date)
 
+        # Classify course + generate audio explainer in background (non-blocking)
+        def _post_process():
+            try:
+                gc = Groq(api_key=os.environ["GROQ_API_KEY"])
+                classify_lecture(session_id, title, date, notes_md, gc)
+                generate_explainer_audio(session_id, title, date, notes_md, groq_client=gc)
+            except Exception:
+                pass
+        _threading.Thread(target=_post_process, daemon=True).start()
+
     except Exception as e:
         err_str = str(e)
         job_kwargs = {"status": "error", "msg": err_str[:300]}
@@ -1767,6 +1928,15 @@ def _run_all_locked(ids):
                 notes_md = generate_notes(title, date, transcript, status_cb=_status)
                 with open(notes_path(sid), "w") as f:
                     f.write(notes_md)
+                # Classify + generate explainer sequentially (one lecture at a time)
+                try:
+                    gc = Groq(api_key=os.environ["GROQ_API_KEY"])
+                    _status(f"Classifying course for '{title[:35]}'…")
+                    classify_lecture(sid, title, date, notes_md, gc)
+                    generate_explainer_audio(sid, title, date, notes_md,
+                                             status_cb=_status, groq_client=gc)
+                except Exception:
+                    pass
                 return True, title, method
             except Exception as e:
                 err_str = str(e)
@@ -1984,7 +2154,7 @@ def job_all_status():
           </div>
         </div>
         {fail_html}
-        {"".join(f'<div class=\"card\" style=\"border-color:#065f46\"><div class=\"meta\">{t}</div></div>' for t in completed[-3:])}
+        {chr(10).join('<div class="card" style="border-color:#065f46"><div class="meta">' + t + '</div></div>' for t in completed[-3:])}
         <meta http-equiv="refresh" content="8">"""
 
     return PAGE.format(body=body)
@@ -2018,6 +2188,239 @@ def download(session_id):
     )
 
 
+# ---------------------------------------------------------------------------
+# Dashboard routes
+# ---------------------------------------------------------------------------
+
+@app.route("/")
+@app.route("/dashboard")
+def dashboard():
+    metas = get_all_lecture_meta()
+
+    # Group by course
+    courses = {}
+    for m in metas:
+        c = m.get("course", "Uncategorised")
+        if c not in courses:
+            courses[c] = {"lecturer": m.get("lecturer", "Unknown"),
+                          "lectures": [], "tasks": []}
+        courses[c]["lectures"].append(m)
+        courses[c]["tasks"].extend(m.get("tasks", []))
+
+    job = _get_job("all")
+    processing_html = ""
+    if job.get("status") == "working":
+        processing_html = f"""
+        <div class="card" style="border-color:#6366f1;margin-bottom:16px">
+          <div><span class="spinner"></span> {job.get("msg", "Working…")}</div>
+          <a href="/status-all" style="font-size:0.8rem;color:#6366f1;display:block;margin-top:8px">View progress →</a>
+        </div>"""
+
+    if not courses:
+        body = f"""
+        <h1>My Courses</h1>
+        {processing_html}
+        <div class="card">
+          <p style="color:#64748b">No lectures processed yet.</p>
+          <a href="/lectures" class="btn btn-primary btn-full" style="margin-top:12px">Go to lecture list →</a>
+        </div>"""
+        return PAGE.format(body=body)
+
+    course_cards = []
+    for course_name, info in sorted(courses.items()):
+        slug = _course_slug(course_name)
+        lec_count = len(info["lectures"])
+        task_count = len(info["tasks"])
+        latest = info["lectures"][0].get("date", "") if info["lectures"] else ""
+        task_badge = (f'<span class="badge" style="background:#4c1d95;color:#ddd8fe;margin-right:4px">'
+                      f'{task_count} task{"s" if task_count != 1 else ""}</span>') if task_count else ""
+        audio_count = sum(1 for lm in info["lectures"] if lm.get("has_explainer"))
+        audio_badge = (f'<span class="badge" style="background:#0f4c75;color:#93c5fd">'
+                       f'🎧 {audio_count}</span>') if audio_count else ""
+        course_cards.append(f"""
+        <div class="card" onclick="location.href='/course/{slug}'"
+             style="cursor:pointer;border-left:3px solid #6366f1">
+          <h3>{course_name}</h3>
+          <div class="meta">{info["lecturer"]} &middot; {lec_count} lectures &middot; {latest}</div>
+          <div style="margin-top:8px">{task_badge}{audio_badge}</div>
+        </div>""")
+
+    total_tasks = sum(len(v["tasks"]) for v in courses.values())
+    body = f"""
+    <h1>My Courses</h1>
+    <p class="sub">{len(metas)} lectures processed &nbsp;·&nbsp;
+      auto-checks hourly &nbsp;
+      <a href="/lectures?refresh=1" style="font-size:0.8rem;color:#6366f1">Check now</a>
+    </p>
+    {processing_html}
+    {''.join(course_cards)}
+    <a href="/tasks" class="btn btn-primary btn-full" style="margin-top:8px">
+      📋 All Tasks{f' ({total_tasks})' if total_tasks else ''}
+    </a>
+    <a href="/lectures" class="btn btn-sm btn-full"
+       style="background:#1e293b;color:#64748b;margin-top:8px">
+      Lecture list &amp; Generate Notes
+    </a>"""
+    return PAGE.format(body=body)
+
+
+@app.route("/course/<slug>")
+def course_view(slug):
+    metas = get_all_lecture_meta()
+    course_lectures = [m for m in metas
+                       if _course_slug(m.get("course", "Uncategorised")) == slug]
+    if not course_lectures:
+        return redirect(url_for("dashboard"))
+
+    course_name = course_lectures[0].get("course", slug)
+    lecturer = course_lectures[0].get("lecturer", "Unknown")
+
+    all_tasks = [(t, m.get("title", ""), m.get("date", ""))
+                 for m in course_lectures for t in m.get("tasks", [])]
+
+    tasks_html = ""
+    if all_tasks:
+        items = "".join(
+            f'<li style="margin-bottom:8px">'
+            f'<div style="font-size:0.875rem">{t}</div>'
+            f'<div style="font-size:0.75rem;color:#64748b;margin-top:2px">{lec[:40]} · {d}</div>'
+            f'</li>'
+            for t, lec, d in all_tasks)
+        tasks_html = f"""
+        <div class="card" style="border-color:#7c3aed;margin-bottom:16px">
+          <h3 style="color:#c4b5fd;margin-bottom:10px">📋 Tasks ({len(all_tasks)})</h3>
+          <ul style="padding-left:16px;list-style:disc">{items}</ul>
+        </div>"""
+
+    lecture_cards = []
+    for m in course_lectures:
+        sid = m["session_id"]
+        title = m.get("title", "Untitled")
+        date = m.get("date", "")
+        audio_html = ""
+        if m.get("has_explainer"):
+            audio_html = (f'<audio controls style="width:100%;margin:10px 0;border-radius:6px" '
+                          f'src="/lecture/{sid}/audio"></audio>')
+        lecture_cards.append(f"""
+        <div class="card">
+          <h3>{title}</h3>
+          <div class="meta">{date}</div>
+          {audio_html}
+          <div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:8px">
+            <a href="/lecture/{sid}/notes-view" class="btn btn-primary btn-sm">📄 Notes</a>
+            <a href="/download/{sid}" class="btn btn-sm"
+               style="background:#1e293b;color:#94a3b8">⬇ .md</a>
+          </div>
+        </div>""")
+
+    body = f"""
+    <a href="/dashboard" style="color:#6366f1;font-size:0.875rem">← All Courses</a>
+    <h1 style="margin-top:8px">{course_name}</h1>
+    <p class="sub">{lecturer} &middot; {len(course_lectures)} lectures</p>
+    {tasks_html}
+    {''.join(lecture_cards)}"""
+    return PAGE.format(body=body)
+
+
+@app.route("/tasks")
+def tasks_view():
+    metas = get_all_lecture_meta()
+    course_tasks = {}
+    for m in metas:
+        if not m.get("tasks"):
+            continue
+        c = m.get("course", "Uncategorised")
+        course_tasks.setdefault(c, [])
+        for t in m["tasks"]:
+            course_tasks[c].append((t, m.get("title", ""), m.get("date", "")))
+
+    if not course_tasks:
+        body = """
+        <a href="/dashboard" style="color:#6366f1;font-size:0.875rem">← Dashboard</a>
+        <h1 style="margin-top:8px">All Tasks</h1>
+        <div class="card"><p style="color:#64748b">No tasks found in any lecture yet.</p></div>"""
+        return PAGE.format(body=body)
+
+    sections = []
+    for course, tasks in sorted(course_tasks.items()):
+        items = "".join(
+            f'<li style="margin-bottom:10px">'
+            f'<div style="font-size:0.875rem">{t}</div>'
+            f'<div style="font-size:0.75rem;color:#64748b;margin-top:2px">{lec[:40]} · {d}</div>'
+            f'</li>'
+            for t, lec, d in tasks)
+        sections.append(f"""
+        <div class="card">
+          <h3 style="color:#c4b5fd;margin-bottom:10px">{course}</h3>
+          <ul style="padding-left:16px;list-style:disc">{items}</ul>
+        </div>""")
+
+    total = sum(len(v) for v in course_tasks.values())
+    body = f"""
+    <a href="/dashboard" style="color:#6366f1;font-size:0.875rem">← Dashboard</a>
+    <h1 style="margin-top:8px">All Tasks</h1>
+    <p class="sub">{total} tasks across {len(course_tasks)} courses</p>
+    {''.join(sections)}"""
+    return PAGE.format(body=body)
+
+
+@app.route("/lecture/<session_id>/audio")
+def lecture_audio(session_id):
+    audio_path = os.path.join(NOTES_DIR, f"explainer_{session_id}.mp3")
+    if not os.path.exists(audio_path):
+        return "Audio explainer not ready yet", 404
+    return send_file(audio_path, mimetype="audio/mpeg", conditional=True)
+
+
+@app.route("/lecture/<session_id>/notes-view")
+def lecture_notes_view(session_id):
+    import html as _html
+    path = notes_path(session_id)
+    if not os.path.exists(path):
+        return redirect(url_for("dashboard"))
+    with open(path, encoding="utf-8") as f:
+        raw = f.read()
+    meta = _load_meta(session_id)
+    title = meta.get("title", "Lecture Notes")
+    course = meta.get("course", "")
+    back = f"/course/{_course_slug(course)}" if course else "/dashboard"
+
+    # Lightweight markdown → HTML (no external lib needed)
+    html_content = _html.escape(raw)
+    html_content = re.sub(r"^# (.+)$",
+        r'<h2 style="font-size:1.3rem;color:#f1f5f9;margin:20px 0 6px">\1</h2>',
+        html_content, flags=re.MULTILINE)
+    html_content = re.sub(r"^## (.+)$",
+        r'<h3 style="font-size:1.05rem;color:#c4b5fd;margin:16px 0 4px">\1</h3>',
+        html_content, flags=re.MULTILINE)
+    html_content = re.sub(r"^### (.+)$",
+        r'<h4 style="font-size:0.95rem;color:#93c5fd;margin:12px 0 3px">\1</h4>',
+        html_content, flags=re.MULTILINE)
+    html_content = re.sub(r"\*\*(.+?)\*\*", r"<strong>\1</strong>", html_content)
+    html_content = re.sub(r"^- (.+)$",
+        r'<li style="margin:3px 0 3px 16px">\1</li>', html_content, flags=re.MULTILINE)
+    html_content = html_content.replace("\n\n", '<br style="margin:6px 0">')
+
+    has_explainer = os.path.exists(os.path.join(NOTES_DIR, f"explainer_{session_id}.mp3"))
+    audio_html = ""
+    if has_explainer:
+        audio_html = (f'<audio controls style="width:100%;margin-bottom:16px;border-radius:6px" '
+                      f'src="/lecture/{session_id}/audio">Your browser does not support audio.</audio>')
+
+    body = f"""
+    <a href="{back}" style="color:#6366f1;font-size:0.875rem">← {course or 'Dashboard'}</a>
+    <h1 style="margin-top:8px;font-size:1.15rem">{_html.escape(title)}</h1>
+    <a href="/download/{session_id}" class="btn btn-sm"
+       style="background:#1e293b;color:#94a3b8;display:inline-block;margin-bottom:14px">
+      ⬇ Download .md
+    </a>
+    {audio_html}
+    <div style="font-size:0.875rem;line-height:1.75;color:#cbd5e1">
+      {html_content}
+    </div>"""
+    return PAGE.format(body=body)
+
+
 def _startup_warmup():
     """Pre-warm SSO and auto-resume any Generate All job interrupted by a restart."""
     time.sleep(8)
@@ -2040,6 +2443,60 @@ def _startup_warmup():
             _threading.Thread(target=_run_all, args=(remaining,), daemon=True).start()
     except Exception:
         pass  # No pending job, nothing to resume
+
+    # Backfill: classify any already-processed lectures that lack course metadata
+    def _backfill():
+        time.sleep(60)
+        try:
+            gc = Groq(api_key=os.environ["GROQ_API_KEY"])
+        except Exception:
+            return
+        try:
+            for fname in sorted(os.listdir(NOTES_DIR)):
+                if not (fname.startswith("notes_") and fname.endswith(".md")):
+                    continue
+                sid = fname[6:-3]
+                if _load_meta(sid).get("course"):
+                    continue
+                try:
+                    with open(os.path.join(NOTES_DIR, fname), encoding="utf-8") as f:
+                        notes_md = f.read()
+                    # Extract title/date from notes header
+                    t_match = re.search(r"^# (.+)$", notes_md, re.MULTILINE)
+                    d_match = re.search(r"\*\*Date:\*\* (.+)$", notes_md, re.MULTILINE)
+                    title = t_match.group(1) if t_match else "Untitled"
+                    date = d_match.group(1).strip() if d_match else ""
+                    classify_lecture(sid, title, date, notes_md, gc)
+                    time.sleep(3)  # gentle rate-limit buffer
+                except Exception:
+                    pass
+        except Exception:
+            pass
+    _threading.Thread(target=_backfill, daemon=True).start()
+
+    # Auto-poll: check Panopto every hour for new lectures, process automatically
+    def _auto_poll():
+        time.sleep(3600)  # first check 1h after startup
+        while True:
+            try:
+                if session_is_ready() and not _run_all_lock.locked():
+                    sessions = list_shared_sessions(force_refresh=True)
+                    new_ids = [s["Id"] for s in sessions
+                               if not os.path.exists(notes_path(s["Id"]))]
+                    if new_ids:
+                        try:
+                            with open(_PENDING_ALL_PATH, "w") as f:
+                                json.dump(new_ids, f)
+                        except Exception:
+                            pass
+                        _set_job("all", status="working",
+                                 msg=f"Auto-processing {len(new_ids)} new lecture(s)…",
+                                 completed=[], failed=[])
+                        _threading.Thread(target=_run_all, args=(new_ids,), daemon=True).start()
+            except Exception:
+                pass
+            time.sleep(3600)
+    _threading.Thread(target=_auto_poll, daemon=True).start()
 
 _threading.Thread(target=_startup_warmup, daemon=True).start()
 
