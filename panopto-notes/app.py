@@ -1406,7 +1406,7 @@ def health():
     except Exception:
         browsers = []
     status = {
-        "version": "2026-04-23-v34",
+        "version": "2026-04-23-v35",
         "session_ready": session_is_ready(),
         "sso_last_error": _sso_last_error,
         "pw_browsers": browsers,
@@ -2246,6 +2246,22 @@ def dashboard():
         </div>""")
 
     total_tasks = sum(len(v["tasks"]) for v in courses.values())
+    missing_audio = sum(1 for m in metas if not m.get("has_explainer"))
+    audio_btn = ""
+    if missing_audio and not _explainer_lock.locked():
+        audio_btn = f"""
+        <form method="post" action="/generate-explainers" style="margin-top:8px">
+          <button class="btn btn-sm btn-full" type="submit"
+                  style="background:#0f4c75;color:#93c5fd">
+            🎧 Generate {missing_audio} missing audio explainer{"s" if missing_audio != 1 else ""}
+          </button>
+        </form>"""
+    elif _explainer_lock.locked():
+        audio_btn = """
+        <div class="card" style="margin-top:8px;border-color:#0f4c75">
+          <span class="spinner"></span> Generating audio explainers…
+        </div>"""
+
     body = f"""
     <h1>My Courses</h1>
     <p class="sub">{len(metas)} lectures processed &nbsp;·&nbsp;
@@ -2257,11 +2273,46 @@ def dashboard():
     <a href="/tasks" class="btn btn-primary btn-full" style="margin-top:8px">
       📋 All Tasks{f' ({total_tasks})' if total_tasks else ''}
     </a>
+    {audio_btn}
     <a href="/lectures" class="btn btn-sm btn-full"
        style="background:#1e293b;color:#64748b;margin-top:8px">
       Lecture list &amp; Generate Notes
     </a>"""
     return PAGE.format(body=body)
+
+
+_explainer_lock = _threading.Lock()
+
+@app.route("/generate-explainers", methods=["POST"])
+def generate_explainers():
+    """Trigger audio explainer generation for all lectures that don't have one."""
+    def _run():
+        with _explainer_lock:
+            try:
+                gc = Groq(api_key=os.environ["GROQ_API_KEY"])
+            except Exception:
+                return
+            for fname in sorted(os.listdir(NOTES_DIR)):
+                if not (fname.startswith("notes_") and fname.endswith(".md")):
+                    continue
+                sid = fname[6:-3]
+                if os.path.exists(os.path.join(NOTES_DIR, f"explainer_{sid}.mp3")):
+                    continue
+                try:
+                    with open(os.path.join(NOTES_DIR, fname), encoding="utf-8") as f:
+                        notes_md = f.read()
+                    meta = _load_meta(sid)
+                    t_m = re.search(r"^# (.+)$", notes_md, re.MULTILINE)
+                    d_m = re.search(r"\*\*Date:\*\* (.+)$", notes_md, re.MULTILINE)
+                    title = t_m.group(1) if t_m else meta.get("title", "Untitled")
+                    date = d_m.group(1).strip() if d_m else meta.get("date", "")
+                    generate_explainer_audio(sid, title, date, notes_md, groq_client=gc)
+                    time.sleep(5)
+                except Exception:
+                    pass
+    if not _explainer_lock.locked():
+        _threading.Thread(target=_run, daemon=True).start()
+    return redirect(url_for("dashboard"))
 
 
 @app.route("/course/<slug>")
@@ -2447,6 +2498,9 @@ def _startup_warmup():
     # Backfill: classify any already-processed lectures that lack course metadata
     def _backfill():
         time.sleep(60)
+        # Don't compete with an active Generate All job
+        if _run_all_lock.locked():
+            time.sleep(600)
         try:
             gc = Groq(api_key=os.environ["GROQ_API_KEY"])
         except Exception:
@@ -2456,18 +2510,25 @@ def _startup_warmup():
                 if not (fname.startswith("notes_") and fname.endswith(".md")):
                     continue
                 sid = fname[6:-3]
-                if _load_meta(sid).get("course"):
+                meta = _load_meta(sid)
+                needs_classify = not meta.get("course")
+                needs_audio = not os.path.exists(
+                    os.path.join(NOTES_DIR, f"explainer_{sid}.mp3"))
+                if not needs_classify and not needs_audio:
                     continue
                 try:
                     with open(os.path.join(NOTES_DIR, fname), encoding="utf-8") as f:
                         notes_md = f.read()
-                    # Extract title/date from notes header
                     t_match = re.search(r"^# (.+)$", notes_md, re.MULTILINE)
                     d_match = re.search(r"\*\*Date:\*\* (.+)$", notes_md, re.MULTILINE)
-                    title = t_match.group(1) if t_match else "Untitled"
-                    date = d_match.group(1).strip() if d_match else ""
-                    classify_lecture(sid, title, date, notes_md, gc)
-                    time.sleep(3)  # gentle rate-limit buffer
+                    title = t_match.group(1) if t_match else meta.get("title", "Untitled")
+                    date = d_match.group(1).strip() if d_match else meta.get("date", "")
+                    if needs_classify:
+                        classify_lecture(sid, title, date, notes_md, gc)
+                        time.sleep(3)
+                    if needs_audio:
+                        generate_explainer_audio(sid, title, date, notes_md, groq_client=gc)
+                        time.sleep(5)
                 except Exception:
                     pass
         except Exception:
