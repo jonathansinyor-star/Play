@@ -1231,6 +1231,8 @@ def get_all_lecture_meta():
             meta.setdefault("course", "Uncategorised")
             meta.setdefault("lecturer", "Unknown")
             meta.setdefault("tasks", [])
+            meta["has_video"] = os.path.exists(
+                os.path.join(NOTES_DIR, f"video_{sid}.mp4"))
             meta["has_explainer"] = os.path.exists(
                 os.path.join(NOTES_DIR, f"explainer_{sid}.mp3"))
             metas.append(meta)
@@ -1302,6 +1304,207 @@ def generate_explainer_audio(session_id, title, date, notes_md, status_cb=None, 
             gTTS(text=script, lang="en").save(audio_path)
     except Exception:
         pass  # explainer is optional — never blocks notes pipeline
+
+
+SLIDES_PROMPT = """Create a slide deck for this university lecture as JSON.
+
+Generate 10-14 slides. Each slide covers one key concept.
+First slide: introduce the topic. Last slide: exam takeaways.
+
+Return ONLY valid JSON, no other text:
+{{"slides": [
+  {{
+    "title": "Slide title (short, clear)",
+    "bullets": ["Key point 1", "Key point 2", "Key point 3"],
+    "narration": "Spoken explanation, 50-80 words, natural conversational English, no bullet symbols"
+  }}
+]}}
+
+Lecture: {title}
+Date: {date}
+
+Notes:
+{notes_excerpt}"""
+
+
+def _find_font(size):
+    """Return a PIL ImageFont, trying system fonts before falling back to default."""
+    from PIL import ImageFont
+    candidates = [
+        "/run/current-system/sw/share/X11/fonts/truetype/dejavu/DejaVuSans.ttf",
+        "/nix/var/nix/profiles/default/share/fonts/truetype/DejaVuSans.ttf",
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+        "/usr/share/fonts/dejavu/DejaVuSans.ttf",
+        "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
+        "/usr/share/fonts/truetype/freefont/FreeSans.ttf",
+    ]
+    # Ask fontconfig for whatever's available
+    try:
+        out = subprocess.run(["fc-list", "--format=%{file}\n"],
+                             capture_output=True, text=True, timeout=5).stdout
+        for line in out.splitlines():
+            p = line.strip()
+            if p.lower().endswith(".ttf") and os.path.exists(p):
+                candidates.insert(0, p)
+                break
+    except Exception:
+        pass
+    for path in candidates:
+        try:
+            return ImageFont.truetype(path, size)
+        except Exception:
+            pass
+    return ImageFont.load_default()
+
+
+def _render_slide(title, bullets, slide_num, total, lecture_title, date_str, out_path):
+    """Render a 1280×720 slide PNG."""
+    from PIL import Image, ImageDraw
+    W, H = 1280, 720
+    img = Image.new("RGB", (W, H), (15, 23, 42))
+    d = ImageDraw.Draw(img)
+
+    # Top accent bar
+    d.rectangle([(0, 0), (W, 7)], fill=(99, 102, 241))
+
+    # Header: course + slide number
+    fn_sm = _find_font(22)
+    d.text((40, 20), f"{lecture_title[:55]}  ·  {date_str}", font=fn_sm, fill=(100, 116, 139))
+    d.text((W - 80, 20), f"{slide_num}/{total}", font=fn_sm, fill=(100, 116, 139))
+
+    # Title (word-wrapped, up to 2 lines)
+    fn_title = _find_font(54)
+    words, lines, cur = title.split(), [], []
+    for w in words:
+        test = " ".join(cur + [w])
+        if d.textlength(test, font=fn_title) > W - 80 and cur:
+            lines.append(" ".join(cur)); cur = [w]
+        else:
+            cur.append(w)
+    if cur:
+        lines.append(" ".join(cur))
+    y = 75
+    for line in lines[:2]:
+        d.text((40, y), line, font=fn_title, fill=(248, 250, 252))
+        y += 68
+
+    # Accent underline
+    d.rectangle([(40, y + 8), (160, y + 12)], fill=(99, 102, 241))
+    y += 36
+
+    # Bullets
+    fn_b = _find_font(34)
+    for bullet in bullets[:5]:
+        d.ellipse([(40, y + 13), (54, y + 27)], fill=(99, 102, 241))
+        # wrap bullet
+        bwords, blines, bcur = bullet.split(), [], []
+        for bw in bwords:
+            test = " ".join(bcur + [bw])
+            if d.textlength(test, font=fn_b) > W - 120 and bcur:
+                blines.append(" ".join(bcur)); bcur = [bw]
+            else:
+                bcur.append(bw)
+        if bcur:
+            blines.append(" ".join(bcur))
+        for bl in blines[:2]:
+            d.text((68, y), bl, font=fn_b, fill=(203, 213, 225))
+            y += 46
+        y += 6
+        if y > H - 50:
+            break
+
+    img.save(out_path, "PNG")
+
+
+def generate_lecture_video(session_id, title, date, notes_md, status_cb=None, groq_client=None):
+    """Generate a slide-based MP4 video for a lecture (stored in NOTES_DIR)."""
+    video_path = os.path.join(NOTES_DIR, f"video_{session_id}.mp4")
+    if os.path.exists(video_path):
+        return
+    if groq_client is None:
+        groq_client = Groq(api_key=os.environ["GROQ_API_KEY"])
+
+    tmp_dir = tempfile.mkdtemp(prefix=f"vid_{session_id[:8]}_")
+    try:
+        # 1. Generate slide structure
+        if status_cb:
+            status_cb(f"Planning video for '{title[:30]}'…")
+        raw = groq_client.chat.completions.create(
+            model="llama-3.3-70b-versatile",
+            messages=[{"role": "user", "content": SLIDES_PROMPT.format(
+                title=title, date=date, notes_excerpt=notes_md[:5500])}],
+            temperature=0.3, max_tokens=2500,
+        ).choices[0].message.content
+        m = re.search(r"\{.*\}", raw, re.DOTALL)
+        if not m:
+            return
+        slides = json.loads(m.group()).get("slides", [])
+        if not slides:
+            return
+
+        # 2. Per-slide: render PNG + TTS → combine into clip
+        clip_paths = []
+        for i, slide in enumerate(slides, 1):
+            if status_cb:
+                status_cb(f"Video slide {i}/{len(slides)}: '{title[:25]}'…")
+            png = os.path.join(tmp_dir, f"s{i:03d}.png")
+            mp3 = os.path.join(tmp_dir, f"a{i:03d}.mp3")
+            mp4 = os.path.join(tmp_dir, f"c{i:03d}.mp4")
+
+            _render_slide(slide.get("title", ""), slide.get("bullets", []),
+                          i, len(slides), title, date, png)
+
+            narration = slide.get("narration") or slide.get("title", "")
+            try:
+                import edge_tts
+                async def _tts(txt, dst):
+                    await edge_tts.Communicate(txt, "en-US-AriaNeural").save(dst)
+                asyncio.run(_tts(narration, mp3))
+            except Exception:
+                try:
+                    from gtts import gTTS
+                    gTTS(text=narration, lang="en").save(mp3)
+                except Exception:
+                    subprocess.run(
+                        ["ffmpeg", "-y", "-f", "lavfi",
+                         "-i", "anullsrc=r=22050:cl=mono", "-t", "4", mp3],
+                        capture_output=True)
+
+            subprocess.run(
+                ["ffmpeg", "-y", "-loop", "1", "-i", png, "-i", mp3,
+                 "-c:v", "libx264", "-preset", "fast", "-crf", "28",
+                 "-c:a", "aac", "-b:a", "96k",
+                 "-shortest", "-pix_fmt", "yuv420p", mp4],
+                capture_output=True, timeout=120)
+
+            if os.path.exists(mp4) and os.path.getsize(mp4) > 2000:
+                clip_paths.append(mp4)
+
+        if not clip_paths:
+            return
+
+        # 3. Concatenate all clips
+        if status_cb:
+            status_cb(f"Assembling video for '{title[:30]}'…")
+        concat = os.path.join(tmp_dir, "list.txt")
+        with open(concat, "w") as cf:
+            for cp in clip_paths:
+                cf.write(f"file '{cp}'\n")
+        subprocess.run(
+            ["ffmpeg", "-y", "-f", "concat", "-safe", "0",
+             "-i", concat, "-c", "copy", video_path],
+            capture_output=True, timeout=300)
+
+        if status_cb and os.path.exists(video_path):
+            status_cb(f"Video ready: '{title[:30]}'")
+    except Exception:
+        pass
+    finally:
+        import shutil
+        try:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+        except Exception:
+            pass
 
 
 # ---------------------------------------------------------------------------
@@ -1406,7 +1609,7 @@ def health():
     except Exception:
         browsers = []
     status = {
-        "version": "2026-04-23-v36",
+        "version": "2026-04-23-v37",
         "session_ready": session_is_ready(),
         "sso_last_error": _sso_last_error,
         "pw_browsers": browsers,
@@ -1852,12 +2055,12 @@ def _run_single(session_id):
         source_label = "captions" if "caption" in method else "Whisper"
         _set_job(session_id, status="done", msg=f"Notes ready ({source_label})", title=title, date=date)
 
-        # Classify course + generate audio explainer in background (non-blocking)
+        # Classify + generate video in background (non-blocking)
         def _post_process():
             try:
                 gc = Groq(api_key=os.environ["GROQ_API_KEY"])
                 classify_lecture(session_id, title, date, notes_md, gc)
-                generate_explainer_audio(session_id, title, date, notes_md, groq_client=gc)
+                generate_lecture_video(session_id, title, date, notes_md, groq_client=gc)
             except Exception:
                 pass
         _threading.Thread(target=_post_process, daemon=True).start()
@@ -1929,13 +2132,13 @@ def _run_all_locked(ids):
                 notes_md = generate_notes(title, date, transcript, status_cb=_status)
                 with open(notes_path(sid), "w") as f:
                     f.write(notes_md)
-                # Classify + generate explainer sequentially (one lecture at a time)
+                # Classify + generate video sequentially
                 try:
                     gc = Groq(api_key=os.environ["GROQ_API_KEY"])
                     _status(f"Classifying course for '{title[:35]}'…")
                     classify_lecture(sid, title, date, notes_md, gc)
-                    generate_explainer_audio(sid, title, date, notes_md,
-                                             status_cb=_status, groq_client=gc)
+                    generate_lecture_video(sid, title, date, notes_md,
+                                           status_cb=_status, groq_client=gc)
                 except Exception:
                     pass
                 return True, title, method
@@ -2234,32 +2437,38 @@ def dashboard():
         latest = info["lectures"][0].get("date", "") if info["lectures"] else ""
         task_badge = (f'<span class="badge" style="background:#4c1d95;color:#ddd8fe;margin-right:4px">'
                       f'{task_count} task{"s" if task_count != 1 else ""}</span>') if task_count else ""
-        audio_count = sum(1 for lm in info["lectures"] if lm.get("has_explainer"))
-        audio_badge = (f'<span class="badge" style="background:#0f4c75;color:#93c5fd">'
-                       f'🎧 {audio_count}</span>') if audio_count else ""
+        video_count = sum(1 for lm in info["lectures"] if lm.get("has_video"))
+        audio_count = sum(1 for lm in info["lectures"] if lm.get("has_explainer") and not lm.get("has_video"))
+        media_badge = ""
+        if video_count:
+            media_badge += (f'<span class="badge" style="background:#0f4c75;color:#93c5fd;margin-right:4px">'
+                            f'🎬 {video_count} video{"s" if video_count != 1 else ""}</span>')
+        if audio_count:
+            media_badge += (f'<span class="badge" style="background:#0f4c75;color:#93c5fd">'
+                            f'🎧 {audio_count}</span>')
         course_cards.append(f"""
         <div class="card" onclick="location.href='/course/{slug}'"
              style="cursor:pointer;border-left:3px solid #6366f1">
           <h3>{course_name}</h3>
           <div class="meta">{info["lecturer"]} &middot; {lec_count} lectures &middot; {latest}</div>
-          <div style="margin-top:8px">{task_badge}{audio_badge}</div>
+          <div style="margin-top:8px">{task_badge}{media_badge}</div>
         </div>""")
 
     total_tasks = sum(len(v["tasks"]) for v in courses.values())
-    missing_audio = sum(1 for m in metas if not m.get("has_explainer"))
-    audio_btn = ""
-    if missing_audio and not _explainer_lock.locked():
-        audio_btn = f"""
+    missing_video = sum(1 for m in metas if not m.get("has_video"))
+    video_btn = ""
+    if missing_video and not _explainer_lock.locked():
+        video_btn = f"""
         <form method="post" action="/generate-explainers" style="margin-top:8px">
           <button class="btn btn-sm btn-full" type="submit"
                   style="background:#0f4c75;color:#93c5fd">
-            🎧 Generate {missing_audio} missing audio explainer{"s" if missing_audio != 1 else ""}
+            🎬 Generate {missing_video} missing video{"s" if missing_video != 1 else ""}
           </button>
         </form>"""
     elif _explainer_lock.locked():
-        audio_btn = """
+        video_btn = """
         <div class="card" style="margin-top:8px;border-color:#0f4c75">
-          <span class="spinner"></span> Generating audio explainers…
+          <span class="spinner"></span> Generating videos…
         </div>"""
 
     body = f"""
@@ -2273,7 +2482,7 @@ def dashboard():
     <a href="/tasks" class="btn btn-primary btn-full" style="margin-top:8px">
       📋 All Tasks{f' ({total_tasks})' if total_tasks else ''}
     </a>
-    {audio_btn}
+    {video_btn}
     <a href="/lectures" class="btn btn-sm btn-full"
        style="background:#1e293b;color:#64748b;margin-top:8px">
       Lecture list &amp; Generate Notes
@@ -2296,7 +2505,7 @@ def generate_explainers():
                 if not (fname.startswith("notes_") and fname.endswith(".md")):
                     continue
                 sid = fname[6:-3]
-                if os.path.exists(os.path.join(NOTES_DIR, f"explainer_{sid}.mp3")):
+                if os.path.exists(os.path.join(NOTES_DIR, f"video_{sid}.mp4")):
                     continue
                 try:
                     with open(os.path.join(NOTES_DIR, fname), encoding="utf-8") as f:
@@ -2306,7 +2515,7 @@ def generate_explainers():
                     d_m = re.search(r"\*\*Date:\*\* (.+)$", notes_md, re.MULTILINE)
                     title = t_m.group(1) if t_m else meta.get("title", "Untitled")
                     date = d_m.group(1).strip() if d_m else meta.get("date", "")
-                    generate_explainer_audio(sid, title, date, notes_md, groq_client=gc)
+                    generate_lecture_video(sid, title, date, notes_md, groq_client=gc)
                     time.sleep(5)
                 except Exception:
                     pass
@@ -2348,15 +2557,21 @@ def course_view(slug):
         sid = m["session_id"]
         title = m.get("title", "Untitled")
         date = m.get("date", "")
-        audio_html = ""
-        if m.get("has_explainer"):
-            audio_html = (f'<audio controls style="width:100%;margin:10px 0;border-radius:6px" '
+        has_video = os.path.exists(os.path.join(NOTES_DIR, f"video_{sid}.mp4"))
+        has_audio = m.get("has_explainer", False)
+        media_html = ""
+        if has_video:
+            media_html = (f'<video controls style="width:100%;border-radius:8px;margin:10px 0;'
+                          f'background:#000;max-height:360px" src="/lecture/{sid}/video">'
+                          f'Your browser does not support video.</video>')
+        elif has_audio:
+            media_html = (f'<audio controls style="width:100%;margin:10px 0" '
                           f'src="/lecture/{sid}/audio"></audio>')
         lecture_cards.append(f"""
         <div class="card">
           <h3>{title}</h3>
           <div class="meta">{date}</div>
-          {audio_html}
+          {media_html}
           <div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:8px">
             <a href="/lecture/{sid}/notes-view" class="btn btn-primary btn-sm">📄 Notes</a>
             <a href="/download/{sid}" class="btn btn-sm"
@@ -2413,6 +2628,14 @@ def tasks_view():
     <p class="sub">{total} tasks across {len(course_tasks)} courses</p>
     {''.join(sections)}"""
     return PAGE.format(body=body)
+
+
+@app.route("/lecture/<session_id>/video")
+def lecture_video(session_id):
+    path = os.path.join(NOTES_DIR, f"video_{session_id}.mp4")
+    if not os.path.exists(path):
+        return "Video not ready yet", 404
+    return send_file(path, mimetype="video/mp4", conditional=True)
 
 
 @app.route("/lecture/<session_id>/audio")
@@ -2512,9 +2735,9 @@ def _startup_warmup():
                 sid = fname[6:-3]
                 meta = _load_meta(sid)
                 needs_classify = not meta.get("course")
-                needs_audio = not os.path.exists(
-                    os.path.join(NOTES_DIR, f"explainer_{sid}.mp3"))
-                if not needs_classify and not needs_audio:
+                needs_video = not os.path.exists(
+                    os.path.join(NOTES_DIR, f"video_{sid}.mp4"))
+                if not needs_classify and not needs_video:
                     continue
                 try:
                     with open(os.path.join(NOTES_DIR, fname), encoding="utf-8") as f:
@@ -2526,8 +2749,8 @@ def _startup_warmup():
                     if needs_classify:
                         classify_lecture(sid, title, date, notes_md, gc)
                         time.sleep(3)
-                    if needs_audio:
-                        generate_explainer_audio(sid, title, date, notes_md, groq_client=gc)
+                    if needs_video:
+                        generate_lecture_video(sid, title, date, notes_md, groq_client=gc)
                         time.sleep(5)
                 except Exception:
                     pass
