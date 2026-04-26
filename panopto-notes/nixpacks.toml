@@ -1,0 +1,5 @@
+[phases.setup]
+nixPkgs = ["ffmpeg", "dejavu_fonts"]
+
+[phases.build]
+cmds = ["playwright install chromium --with-deps || playwright install chromium"]
