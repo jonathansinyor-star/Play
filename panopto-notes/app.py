@@ -1609,7 +1609,7 @@ def health():
     except Exception:
         browsers = []
     status = {
-        "version": "2026-04-26-v38",
+        "version": "2026-04-26-v39",
         "session_ready": session_is_ready(),
         "sso_last_error": _sso_last_error,
         "pw_browsers": browsers,
@@ -2500,6 +2500,9 @@ def catchup():
     <p class="sub">{total_done}/{total_all} lectures have notes
       &nbsp;·&nbsp; <a href="/catchup" style="color:#6366f1;font-size:0.8rem">Refresh</a>
     </p>
+    <a href="/chat" class="btn btn-primary btn-full" style="margin-bottom:16px">
+      💬 Ask the study chatbot
+    </a>
     {deepgram_tip}
     {processing_html}
     {''.join(sections) if sections else
@@ -2806,6 +2809,195 @@ def lecture_notes_view(session_id):
       {html_content}
     </div>"""
     return PAGE.format(body=body)
+
+
+CHAT_SYSTEM_PROMPT = """You are a helpful university study assistant. You have access to a student's lecture notes.
+Answer their question using ONLY the provided notes. Be specific and direct.
+- If they ask about homework/tasks/deadlines: list every one mentioned clearly.
+- If they ask about a concept: explain it from the notes with any examples given.
+- If they ask what they missed: summarise the key points.
+- If the answer is not in the notes provided: say "I don't have notes for that yet."
+Never make up content not in the notes."""
+
+_ORDINALS = {
+    "first": 1, "1st": 1, "second": 2, "2nd": 2, "third": 3, "3rd": 3,
+    "fourth": 4, "4th": 4, "fifth": 5, "5th": 5, "sixth": 6, "6th": 6,
+    "seventh": 7, "7th": 7, "eighth": 8, "8th": 8, "ninth": 9, "9th": 9,
+    "tenth": 10, "10th": 10,
+}
+
+
+def _build_chat_context(question):
+    """Return (context_text, matched_course, matched_lecture_title) for the question."""
+    metas = get_all_lecture_meta()
+    if not metas:
+        return "No lecture notes available yet.", None, None
+
+    q = question.lower()
+
+    # Detect ordinal ("second lecture", "lecture 3")
+    target_index = None
+    for word, idx in _ORDINALS.items():
+        if word in q:
+            target_index = idx
+            break
+    m_num = re.search(r"lecture\s+(\d+)", q)
+    if m_num:
+        target_index = int(m_num.group(1))
+
+    # Score each lecture's relevance to the question
+    def _score(m):
+        score = 0
+        course = m.get("course", "").lower()
+        title = m.get("title", "").lower()
+        # Course name words in question
+        for word in course.split():
+            if len(word) > 3 and word in q:
+                score += 3
+        # Title words in question
+        for word in title.split():
+            if len(word) > 4 and word in q:
+                score += 1
+        return score
+
+    scored = sorted(metas, key=_score, reverse=True)
+    best_score = _score(scored[0]) if scored else 0
+
+    # If a specific course matched, narrow to that course then apply ordinal
+    if best_score >= 3:
+        best_course = scored[0].get("course", "")
+        course_lectures = sorted(
+            [m for m in metas if m.get("course") == best_course],
+            key=lambda m: m.get("date", "")
+        )
+        if target_index and 1 <= target_index <= len(course_lectures):
+            selected = [course_lectures[target_index - 1]]
+        else:
+            selected = course_lectures  # all lectures in that course
+        matched_course = best_course
+    else:
+        # General question — use top-scored lectures
+        selected = scored[:5] if not target_index else scored[:3]
+        matched_course = None
+
+    # Build context from selected lectures
+    parts = []
+    for m in selected[:6]:  # cap at 6 notes to stay within token limits
+        sid = m["session_id"]
+        np = notes_path(sid)
+        if os.path.exists(np):
+            with open(np, encoding="utf-8") as f:
+                content = f.read()[:4000]
+            parts.append(
+                f"=== {m.get('course','')} — {m.get('title','')} ({m.get('date','')}) ===\n{content}"
+            )
+
+    matched_title = selected[0].get("title") if selected else None
+    return "\n\n---\n\n".join(parts) if parts else "No notes found.", matched_course, matched_title
+
+
+@app.route("/chat")
+def chat_page():
+    import html as _h
+    metas = get_all_lecture_meta()
+    courses = sorted({m.get("course", "Uncategorised") for m in metas})
+    course_links = " &nbsp;·&nbsp; ".join(
+        f'<a href="#" onclick="ask(\'Summarise {_h.escape(c)}\')" '
+        f'style="color:#6366f1;font-size:0.8rem">{_h.escape(c)}</a>'
+        for c in courses
+    )
+    body = f"""
+    <h1>Study Chat</h1>
+    <p class="sub">Ask anything about your lectures, homework, or course content.</p>
+    <div style="font-size:0.8rem;color:#64748b;margin-bottom:12px">
+      Courses: {course_links or 'none yet'}
+    </div>
+    <div id="msgs" style="min-height:200px;margin-bottom:12px">
+      <div class="card" style="border-color:#334155;color:#64748b;font-size:0.875rem">
+        Try: &ldquo;What homework do I have for research seminar?&rdquo;<br>
+        Or: &ldquo;Summarise the second lecture of business law&rdquo;<br>
+        Or: &ldquo;What are the key topics I need to know for the exam?&rdquo;
+      </div>
+    </div>
+    <div style="display:flex;gap:8px;align-items:flex-end">
+      <textarea id="q" rows="2" placeholder="Ask anything…"
+        style="flex:1;padding:10px 12px;border-radius:8px;background:#1e293b;
+               border:1px solid #334155;color:#e2e8f0;font-size:1rem;
+               resize:none;font-family:inherit"
+        onkeydown="if(event.key==='Enter'&&!event.shiftKey){{event.preventDefault();send();}}">
+      </textarea>
+      <button onclick="send()" class="btn btn-primary" id="sb" style="height:48px;padding:0 20px">
+        Send
+      </button>
+    </div>
+    <a href="/catchup" style="display:block;margin-top:16px;color:#6366f1;font-size:0.8rem">
+      ← Back to courses
+    </a>
+    <script>
+    function ask(q){{document.getElementById('q').value=q;send();}}
+    function send(){{
+      var q=document.getElementById('q').value.trim();
+      if(!q)return;
+      var msgs=document.getElementById('msgs');
+      msgs.innerHTML+=
+        '<div class="card" style="border-color:#6366f1;margin-bottom:10px">'
+        +'<div style="font-size:0.75rem;color:#6366f1;margin-bottom:4px">You</div>'
+        +'<div style="font-size:0.9rem">'+q.replace(/</g,'&lt;')+'</div></div>';
+      document.getElementById('q').value='';
+      document.getElementById('sb').disabled=true;
+      var wait=document.createElement('div');
+      wait.className='card';
+      wait.id='wait';
+      wait.style.marginBottom='10px';
+      wait.innerHTML='<span class="spinner"></span> Thinking…';
+      msgs.appendChild(wait);
+      msgs.scrollTop=msgs.scrollHeight;
+      fetch('/chat/ask',{{method:'POST',headers:{{'Content-Type':'application/json'}},
+        body:JSON.stringify({{message:q}})}})
+        .then(function(r){{return r.json();}})
+        .then(function(d){{
+          var w=document.getElementById('wait');
+          if(w)w.remove();
+          var txt=(d.response||d.error||'Sorry, something went wrong.')
+            .replace(/\\n/g,'<br>').replace(/\\*\\*(.+?)\\*\\*/g,'<strong>$1</strong>');
+          msgs.innerHTML+=
+            '<div class="card" style="border-color:#10b981;margin-bottom:10px">'
+            +'<div style="font-size:0.75rem;color:#10b981;margin-bottom:4px">Assistant</div>'
+            +'<div style="font-size:0.9rem;line-height:1.6">'+txt+'</div></div>';
+          msgs.scrollTop=msgs.scrollHeight;
+          document.getElementById('sb').disabled=false;
+        }})
+        .catch(function(){{
+          var w=document.getElementById('wait');if(w)w.remove();
+          document.getElementById('sb').disabled=false;
+        }});
+    }}
+    </script>"""
+    return PAGE.format(body=body)
+
+
+@app.route("/chat/ask", methods=["POST"])
+def chat_ask():
+    from flask import jsonify
+    data = request.get_json(silent=True) or {}
+    question = (data.get("message") or "").strip()
+    if not question:
+        return jsonify({"error": "Empty question"}), 400
+    try:
+        context, matched_course, matched_title = _build_chat_context(question)
+        gc = Groq(api_key=os.environ["GROQ_API_KEY"])
+        answer = gc.chat.completions.create(
+            model="llama-3.3-70b-versatile",
+            messages=[
+                {"role": "system", "content": CHAT_SYSTEM_PROMPT},
+                {"role": "user", "content": f"Lecture notes:\n{context}\n\nQuestion: {question}"},
+            ],
+            temperature=0.3,
+            max_tokens=900,
+        ).choices[0].message.content
+        return jsonify({"response": answer})
+    except Exception as e:
+        return jsonify({"error": str(e)[:200]}), 500
 
 
 def _startup_warmup():
