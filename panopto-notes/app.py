@@ -1609,7 +1609,7 @@ def health():
     except Exception:
         browsers = []
     status = {
-        "version": "2026-04-23-v37",
+        "version": "2026-04-26-v38",
         "session_ready": session_is_ready(),
         "sso_last_error": _sso_last_error,
         "pw_browsers": browsers,
@@ -1653,7 +1653,7 @@ def index():
         body = '<h1>Lecture Notes</h1><div class="alert alert-err">Missing <code>GROQ_API_KEY</code> — add it in Railway Variables.</div>'
         return PAGE.format(body=body)
 
-    return redirect(url_for("dashboard"))
+    return redirect(url_for("catchup"))
 
 
 @app.route("/set-cookie", methods=["GET", "POST"])
@@ -2055,12 +2055,11 @@ def _run_single(session_id):
         source_label = "captions" if "caption" in method else "Whisper"
         _set_job(session_id, status="done", msg=f"Notes ready ({source_label})", title=title, date=date)
 
-        # Classify + generate video in background (non-blocking)
+        # Classify course in background — lightweight, just one small LLaMA call
         def _post_process():
             try:
                 gc = Groq(api_key=os.environ["GROQ_API_KEY"])
                 classify_lecture(session_id, title, date, notes_md, gc)
-                generate_lecture_video(session_id, title, date, notes_md, groq_client=gc)
             except Exception:
                 pass
         _threading.Thread(target=_post_process, daemon=True).start()
@@ -2132,13 +2131,10 @@ def _run_all_locked(ids):
                 notes_md = generate_notes(title, date, transcript, status_cb=_status)
                 with open(notes_path(sid), "w") as f:
                     f.write(notes_md)
-                # Classify + generate video sequentially
+                # Classify only — video generation removed from main pipeline
                 try:
                     gc = Groq(api_key=os.environ["GROQ_API_KEY"])
-                    _status(f"Classifying course for '{title[:35]}'…")
                     classify_lecture(sid, title, date, notes_md, gc)
-                    generate_lecture_video(sid, title, date, notes_md,
-                                           status_cb=_status, groq_client=gc)
                 except Exception:
                     pass
                 return True, title, method
@@ -2395,6 +2391,123 @@ def download(session_id):
 # ---------------------------------------------------------------------------
 # Dashboard routes
 # ---------------------------------------------------------------------------
+
+@app.route("/catchup")
+def catchup():
+    """The main study page: all courses, all lectures, clear status, missing ones prominent."""
+    import html as _h
+    metas = get_all_lecture_meta()
+    done_ids = {m["session_id"] for m in metas}
+
+    # Also pull the full Panopto session list to show unprocessed lectures
+    all_sessions = []
+    try:
+        if session_is_ready():
+            all_sessions = list_shared_sessions(force_refresh=False)
+    except Exception:
+        pass
+
+    # Build a map of session_id → session info for unprocessed ones
+    missing = [s for s in all_sessions if s.get("Id") and s["Id"] not in done_ids]
+
+    # Group done lectures by course
+    courses = {}
+    for m in metas:
+        c = m.get("course") or "Uncategorised"
+        courses.setdefault(c, []).append(m)
+
+    # Sort each course's lectures by date ascending (chronological)
+    for c in courses:
+        courses[c].sort(key=lambda m: m.get("date", ""))
+
+    job = _get_job("all")
+    processing_html = ""
+    if job.get("status") == "working":
+        processing_html = f"""
+        <div style="background:#1e3a5f;border:1px solid #3b82f6;border-radius:10px;
+                    padding:12px 16px;margin-bottom:16px;font-size:0.875rem">
+          <span class="spinner"></span> {job.get("msg","Working…")}
+          <a href="/status-all" style="color:#93c5fd;float:right">details →</a>
+        </div>"""
+
+    deepgram_tip = "" if os.environ.get("DEEPGRAM_API_KEY") else """
+    <div class="alert" style="border-color:#f59e0b;color:#fcd34d;font-size:0.82rem;margin-bottom:16px">
+      <strong>⚡ Speed up transcription:</strong> Sign up free at deepgram.com →
+      get API key → add <code>DEEPGRAM_API_KEY</code> in Railway Variables.
+      Transcribes 3-hour lectures in minutes instead of hours.
+    </div>"""
+
+    sections = []
+
+    # Missing / unprocessed lectures first — most urgent
+    if missing:
+        ids_json = json.dumps([s["Id"] for s in missing])
+        rows = ""
+        for s in missing:
+            t = _h.escape(s.get("Name", "Untitled"))
+            d = _fmt_date(s.get("StartTime", ""))
+            dur = _fmt_duration(s.get("Duration"))
+            rows += (f'<div style="padding:10px 0;border-bottom:1px solid #1e293b;'
+                     f'display:flex;align-items:center;gap:10px">'
+                     f'<span style="color:#ef4444;font-size:1.1rem">✗</span>'
+                     f'<div style="flex:1"><div style="font-size:0.9rem;color:#f1f5f9">{t}</div>'
+                     f'<div style="font-size:0.75rem;color:#64748b">{d} · {dur}</div></div>'
+                     f'</div>')
+        sections.append(f"""
+        <div class="card" style="border-color:#ef4444;margin-bottom:20px">
+          <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px">
+            <h3 style="color:#fca5a5">⚠ Missing Notes ({len(missing)} lectures)</h3>
+            <form method="post" action="/process-all" style="margin:0">
+              <input type="hidden" name="ids" value='{ids_json}'>
+              <button class="btn btn-primary btn-sm" type="submit">Generate All</button>
+            </form>
+          </div>
+          {rows}
+        </div>""")
+
+    # Done lectures by course
+    for course_name in sorted(courses.keys()):
+        lectures = courses[course_name]
+        slug = _course_slug(course_name)
+        lecturer = lectures[0].get("lecturer", "") if lectures else ""
+        rows = ""
+        for m in lectures:
+            sid = m["session_id"]
+            t = _h.escape(m.get("title", "Untitled"))
+            d = m.get("date", "")
+            has_video = os.path.exists(os.path.join(NOTES_DIR, f"video_{sid}.mp4"))
+            media = "🎬" if has_video else ""
+            rows += (f'<div style="padding:10px 0;border-bottom:1px solid #1e293b;'
+                     f'display:flex;align-items:center;gap:10px">'
+                     f'<span style="color:#10b981;font-size:1.1rem">✓</span>'
+                     f'<div style="flex:1">'
+                     f'<a href="/lecture/{sid}/notes-view" '
+                     f'style="color:#f1f5f9;font-size:0.9rem;text-decoration:none">{t}</a>'
+                     f'<div style="font-size:0.75rem;color:#64748b">{d} {media}</div></div>'
+                     f'<a href="/lecture/{sid}/notes-view" class="btn btn-primary btn-sm">Notes</a>'
+                     f'</div>')
+        sections.append(f"""
+        <div class="card" style="margin-bottom:16px">
+          <h3 style="margin-bottom:2px">{_h.escape(course_name)}</h3>
+          <div class="meta" style="margin-bottom:10px">{_h.escape(lecturer)} · {len(lectures)} lectures</div>
+          {rows}
+        </div>""")
+
+    total_done = len(metas)
+    total_all = total_done + len(missing)
+    body = f"""
+    <h1>Catch Up</h1>
+    <p class="sub">{total_done}/{total_all} lectures have notes
+      &nbsp;·&nbsp; <a href="/catchup" style="color:#6366f1;font-size:0.8rem">Refresh</a>
+    </p>
+    {deepgram_tip}
+    {processing_html}
+    {''.join(sections) if sections else
+     '<div class="card"><p style="color:#64748b">No lectures found. '
+     '<a href="/lectures" style="color:#6366f1">Connect to Panopto →</a></p></div>'}
+    """
+    return PAGE.format(body=body)
+
 
 @app.route("/dashboard")
 def dashboard():
